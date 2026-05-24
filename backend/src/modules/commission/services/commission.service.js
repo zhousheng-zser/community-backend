@@ -13,9 +13,20 @@ const {
   User
 } = require('../../../models');
 const { Op } = require('sequelize');
+const { resolveUserId } = require('../../../utils/resolveUserId');
 
 const ROLE_NAMES = ['headquarters', 'promoter', 'district_partner', 'market_partner'];
 const PARTNER_ROLES = ['promoter', 'district_partner', 'market_partner'];
+
+let partnerBalanceTableReady = false;
+
+async function ensurePartnerBalanceTable() {
+  if (partnerBalanceTableReady) return;
+  if (PartnerCommissionBalance && PartnerCommissionBalance.sync) {
+    await PartnerCommissionBalance.sync();
+  }
+  partnerBalanceTableReady = true;
+}
 
 /**
  * Get all commission rate configs.
@@ -134,12 +145,21 @@ async function upsertBalance(userId, role) {
  * Creates up to 4 commission_distribution records and updates balances.
  * Runs in a transaction for atomicity.
  */
-async function distributeCommission(orderId, orderType, orderAmount, buyerUserId) {
+async function distributeCommission(orderId, orderType, orderAmount, buyerUserId, platformFeeAmount) {
   const sequelize = SystemConfig.sequelize;
 
   return sequelize.transaction(async (t) => {
     const rates = await getCommissionRates();
-    const pool = Number((orderAmount * rates.globalRate).toFixed(2));
+    let pool;
+    if (platformFeeAmount != null && Number(platformFeeAmount) > 0) {
+      pool = Number(Number(platformFeeAmount).toFixed(2));
+    } else {
+      pool = Number((Number(orderAmount) * rates.globalRate).toFixed(2));
+    }
+    if (pool <= 0) {
+      console.log(`[Commission] Zero pool for order ${orderId}, skip`);
+      return [];
+    }
 
     // Find the promoter (user who referred the buyer)
     const buyer = await User.findByPk(buyerUserId, {
@@ -192,6 +212,8 @@ async function distributeCommission(orderId, orderType, orderAmount, buyerUserId
     const distributions = [];
 
     for (const item of distributionPlan) {
+      if (item.role !== 'headquarters' && !item.userId) continue;
+
       const commissionAmount = Number((pool * item.pct).toFixed(2));
 
       if (commissionAmount <= 0) continue;
@@ -316,11 +338,58 @@ async function confirmCommission(orderId) {
 }
 
 /**
+ * Credit available balance for a user role (e.g. neighbor assist helper income).
+ */
+async function creditAvailableBalance(userId, role, amount, transaction) {
+  const uid = resolveUserId(userId);
+  const amt = Number(amount);
+  if (!uid || !role || !(amt > 0)) return null;
+
+  await ensurePartnerBalanceTable();
+
+  let balance = await PartnerCommissionBalance.findOne({
+    where: { user_id: uid, role },
+    transaction
+  });
+
+  if (!balance) {
+    balance = await PartnerCommissionBalance.create({
+      user_id: uid,
+      role,
+      total_earned: amt,
+      available_amount: amt,
+      withdrawn_amount: 0,
+      pending_amount: 0,
+      frozen_amount: 0
+    }, { transaction });
+  } else {
+    await balance.increment({
+      available_amount: amt,
+      total_earned: amt
+    }, { transaction });
+  }
+
+  return balance;
+}
+
+/**
  * Get a user's total commission balance across all their roles.
  */
 async function getUserBalance(userId) {
+  const uid = resolveUserId(userId);
+  if (!uid) {
+    return {
+      total_earned: 0,
+      available_amount: 0,
+      withdrawn_amount: 0,
+      pending_amount: 0,
+      frozen_amount: 0,
+      roles: []
+    };
+  }
+  await ensurePartnerBalanceTable();
   const balances = await PartnerCommissionBalance.findAll({
-    where: { user_id: userId }
+    where: { user_id: uid }
   });
 
   const summary = {
@@ -385,12 +454,35 @@ async function assignPromoterRole(userId) {
   return role;
 }
 
+/**
+ * 从指定角色余额提现
+ */
+async function withdrawFromRole(userId, role, amount) {
+  const uid = resolveUserId(userId);
+  const amt = Number(amount);
+  if (!uid || !role || !(amt > 0)) throw new Error('无效提现参数');
+
+  await ensurePartnerBalanceTable();
+  const balance = await PartnerCommissionBalance.findOne({ where: { user_id: uid, role } });
+  if (!balance || Number(balance.available_amount) < amt) {
+    throw new Error('可提现金额不足');
+  }
+
+  const sequelize = PartnerCommissionBalance.sequelize;
+  await sequelize.transaction(async (t) => {
+    await balance.increment({ available_amount: -amt, withdrawn_amount: amt }, { transaction: t });
+  });
+  return balance;
+}
+
 module.exports = {
   getCommissionRates,
   resolvePartnerChain,
   distributeCommission,
   revertCommission,
   confirmCommission,
+  creditAvailableBalance,
   getUserBalance,
-  assignPromoterRole
+  assignPromoterRole,
+  withdrawFromRole
 };

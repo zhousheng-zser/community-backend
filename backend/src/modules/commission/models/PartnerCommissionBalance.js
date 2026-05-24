@@ -10,7 +10,7 @@ module.exports = (sequelize, DataTypes) => {
 
   PartnerCommissionBalance.init({
     user_id: { type: DataTypes.BIGINT, allowNull: false },
-    role: { type: DataTypes.ENUM('promoter', 'district_partner', 'market_partner'), allowNull: false },
+    role: { type: DataTypes.STRING(32), allowNull: false },
     total_earned: { type: DataTypes.DECIMAL(10, 2), defaultValue: 0 },
     available_amount: { type: DataTypes.DECIMAL(10, 2), defaultValue: 0 },
     withdrawn_amount: { type: DataTypes.DECIMAL(10, 2), defaultValue: 0 },

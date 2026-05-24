@@ -35,7 +35,7 @@ module.exports = async (req, res, next) => {
     if (decoded && decoded.portal === 'service_provider' && decoded.profile_id && decoded.provider_user_id != null) {
       req.spPortal = {
         profile_id: Number(decoded.profile_id),
-        provider_user_id: Number(decoded.provider_user_id),
+        provider_user_id: resolveUserId(decoded.provider_user_id),
         sp_account_id: decoded.sp_account_id != null ? Number(decoded.sp_account_id) : null
       };
       return next();

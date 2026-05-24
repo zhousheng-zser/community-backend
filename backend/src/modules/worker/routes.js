@@ -8,6 +8,8 @@ router.use(authMiddleware);
 // 入驻申请
 router.post('/apply', ctrl.apply);
 router.get('/application/me', ctrl.getMyApplication);
+router.get('/profile/me', ctrl.getMyProfile);
+router.patch('/profile/me', ctrl.updateMyProfile);
 router.get('/applications', ctrl.getApplications);
 router.post('/applications/:id/review', ctrl.reviewApplication);
 

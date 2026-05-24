@@ -9,7 +9,8 @@ const {
   WorkerService,
   ServiceProviderProfile,
   ServiceOrderComplaint,
-  ServiceHomeModule
+  ServiceHomeModule,
+  ServiceItem
 } = require('../models');
 const {
   resolveProviderContext,
@@ -18,6 +19,11 @@ const {
   providerOrderInclude
 } = require('../utils/serviceProviderOrderScope');
 const { applyServiceOrderStatusAfterPayment } = require('../utils/serviceOrderPaidTransition');
+const couponService = require('../modules/coupon/services/coupon.service');
+const commissionService = require('../modules/commission/services/commission.service');
+const platformFeeService = require('../services/platformFee.service');
+const { resolveUserId, resolveUserIdFromReq } = require('../utils/resolveUserId');
+const { resolveServiceProviderProfile } = require('../utils/resolveServiceProviderProfile');
 
 const ok = (res, data) => res.json({ errno: 0, data });
 const fail = (res, errno, errmsg, http = 200) => res.status(http).json({ errno, errmsg });
@@ -92,8 +98,8 @@ async function assertWorkerSellsService(workerUserId, serviceId) {
   return !!row;
 }
 
-function serializeOrderRow(plain, { withDetail = false } = {}) {
-  const amt = plain.amount != null ? String(plain.amount) : '';
+function serializeOrderRow(plain, { withDetail = false, viewerUserId = null } = {}) {
+  const feeView = platformFeeService.displayAmountForRole(plain, viewerUserId, 'service');
   const w = plain.assignedWorker;
   const svc = plain.service;
   const out = {
@@ -104,8 +110,12 @@ function serializeOrderRow(plain, { withDetail = false } = {}) {
     pay_status: plain.pay_status,
     service_id: plain.service_id,
     service_title: svc ? svc.title : (plain.goods_name || ''),
-    amount: amt,
-    pay_amount: amt,
+    amount: feeView.amount,
+    pay_amount: String(feeView.payable_amount),
+    payable_amount: feeView.payable_amount,
+    settlement_amount: feeView.settlement_amount,
+    platform_fee_amount: feeView.platform_fee_amount,
+    platform_fee_rate: feeView.platform_fee_rate,
     created_at: plain.created_at,
     appointment_time: plain.appointment_time,
     community_id: plain.community_id,
@@ -188,12 +198,26 @@ exports.create = async (req, res) => {
     if (Number.isFinite(parsedGoodsPrice)) amount = parsedGoodsPrice * qSafe;
     if (!Number.isFinite(amount) || amount < 0) amount = Number(service.price) * qSafe;
 
+    const goodsAmountBeforeCoupon = amount;
+    let couponDiscount = 0;
+    let couponIssueId = Number(body.coupon_issue_id || body.couponIssueId || 0) || 0;
+    if (couponIssueId > 0) {
+      try {
+        const applied = await couponService.validateCouponForOrder(userId, couponIssueId, goodsAmountBeforeCoupon, null, 'service');
+        couponDiscount = applied.discount;
+        amount = applied.payableAmount;
+      } catch (couponErr) {
+        return fail(res, couponErr.statusCode || 400, couponErr.message || '优惠券不可用');
+      }
+    }
+
     let assigned_worker_id = null;
     let status = 'pending_pay';
     let fulfillment_meta = {};
 
     if (worker_id != null && worker_id !== '') {
-      const wid = parseInt(worker_id, 10);
+      const wid = resolveUserId(worker_id);
+      if (!wid) return fail(res, 400, '无效技工 id');
       const chk = await assertWorkerForCommunity(wid, commId);
       if (!chk.ok) return fail(res, 400, chk.reason || '技工不可用');
       const sells = await assertWorkerSellsService(wid, Number(service_id));
@@ -205,6 +229,11 @@ exports.create = async (req, res) => {
       /** 非直约单：九州中台派同小区技工，支付后待派单 */
       fulfillment_meta = { await_user_confirm: true, dispatch_mode: 'admin_dispatch' };
     }
+    if (couponIssueId > 0 && couponDiscount > 0) {
+      fulfillment_meta.coupon_issue_id = couponIssueId;
+      fulfillment_meta.coupon_discount = couponDiscount;
+      fulfillment_meta.goods_amount_before_coupon = goodsAmountBeforeCoupon;
+    }
 
     let provider_user_id = null;
     if (sj.provider_id != null) {
@@ -212,12 +241,17 @@ exports.create = async (req, res) => {
       if (spp && spp.status === 'active') provider_user_id = spp.user_id;
     }
 
+    const feeFields = await platformFeeService.calcPlatformFee(amount, 'service');
     const row = await ServiceOrder.create({
       user_id: userId,
       community_id: commId,
       service_id: Number(service_id),
       group_key: group_key || null,
       amount,
+      pay_amount: amount,
+      platform_fee_rate: feeFields.platform_fee_rate,
+      platform_fee_amount: feeFields.platform_fee_amount,
+      settlement_amount: feeFields.settlement_amount,
       address_id: address_id ? parseInt(address_id, 10) : null,
       address_snapshot: snap,
       appointment_time: appointment_time || null,
@@ -233,12 +267,19 @@ exports.create = async (req, res) => {
       provider_user_id,
       fulfillment_meta: Object.keys(fulfillment_meta).length ? fulfillment_meta : null
     });
+    if (couponIssueId > 0) {
+      await couponService.markCouponUsed(couponIssueId, 'service', row.order_no || row.id);
+    }
     return ok(res, {
       id: row.id,
       order_id: row.id,
       order_no: row.order_no,
       status: row.status,
-      pay_status: row.pay_status
+      pay_status: row.pay_status,
+      pay_amount: Number(row.amount || 0).toFixed(2),
+      settlement_amount: feeFields.settlement_amount,
+      platform_fee_amount: feeFields.platform_fee_amount,
+      discount_amount: couponDiscount.toFixed(2)
     });
   } catch (e) {
     console.error('serviceOrder create', e);
@@ -263,9 +304,7 @@ exports.createBundle = async (req, res) => {
     if (!provider_id || !Array.isArray(items) || items.length === 0) {
       return fail(res, 400, '缺少 provider_id 或 items');
     }
-    const prof = await ServiceProviderProfile.findOne({
-      where: { user_id: parseInt(provider_id, 10), status: 'active' }
-    });
+    const prof = await resolveServiceProviderProfile(provider_id);
     if (!prof) return fail(res, 404, '服务商不存在');
 
     let commId = community_id != null ? parseInt(community_id, 10) : null;
@@ -274,7 +313,8 @@ exports.createBundle = async (req, res) => {
       commId = u && u.community_id != null ? Number(u.community_id) : null;
     }
     const pj = prof.toJSON ? prof.toJSON() : prof;
-    if (pj.community_id != null && commId != null) {
+    // 直约打包单：仅当服务商显式配置 community_id 且用户也绑定了小区时才校验，避免跨区用户无法下单
+    if (pj.community_id != null && commId != null && Number(pj.community_id) > 0 && Number(commId) > 0) {
       if (Number(pj.community_id) !== Number(commId)) {
         return fail(res, 400, '服务商不接该小区');
       }
@@ -284,10 +324,23 @@ exports.createBundle = async (req, res) => {
     let total = 0;
     for (const it of items) {
       const sid = parseInt(it.service_id, 10);
-      const svc = await Service.findByPk(sid);
-      if (!svc) return fail(res, 400, `服务不存在: ${sid}`);
-      const sj = svc.toJSON();
-      if (sj.is_published === 0 || sj.is_published === false) return fail(res, 400, '含未上架服务');
+      // SP portal saves services to service_items; try that first
+      let sj = null;
+      if (ServiceItem) {
+        try {
+          const si = await ServiceItem.findByPk(sid);
+          if (si) sj = si.toJSON ? si.toJSON() : si;
+        } catch (_) {}
+      }
+      if (!sj) {
+        const svc = await Service.findByPk(sid);
+        if (!svc) return fail(res, 400, `服务不存在: ${sid}`);
+        sj = svc.toJSON ? svc.toJSON() : svc;
+      }
+      const onSale = sj.status === 'on_sale' || sj.is_published === 1 || sj.is_published === true;
+      const offSale = sj.is_published === 0 || sj.is_published === false
+        || (sj.status && sj.status !== 'on_sale' && sj.is_published == null);
+      if (!onSale && offSale) return fail(res, 400, '含未上架服务');
       const q = it.qty != null ? parseInt(it.qty, 10) : 1;
       const qSafe = Number.isFinite(q) && q > 0 ? q : 1;
       const lineAmt = Number(sj.price) * qSafe;
@@ -296,18 +349,45 @@ exports.createBundle = async (req, res) => {
         service_id: sid,
         group_key: it.group_key || null,
         qty: qSafe,
-        title: it.title || sj.title,
+        title: it.title || sj.title || sj.name,
         unit_price: sj.price
       });
     }
 
     const first = lines[0];
+    const goodsAmountBeforeCoupon = total;
+    let couponDiscount = 0;
+    let couponIssueId = Number(body.coupon_issue_id || body.couponIssueId || 0) || 0;
+    if (couponIssueId > 0) {
+      try {
+        const applied = await couponService.validateCouponForOrder(userId, couponIssueId, goodsAmountBeforeCoupon, null, 'service');
+        couponDiscount = applied.discount;
+        total = applied.payableAmount;
+      } catch (couponErr) {
+        return fail(res, couponErr.statusCode || 400, couponErr.message || '优惠券不可用');
+      }
+    }
+    const feeFields = await platformFeeService.calcPlatformFee(total, 'service');
+    const fulfillmentMeta = {
+      bundle_lines: lines,
+      mode: 'sp_bundle',
+      await_user_confirm: true
+    };
+    if (couponIssueId > 0 && couponDiscount > 0) {
+      fulfillmentMeta.coupon_issue_id = couponIssueId;
+      fulfillmentMeta.coupon_discount = couponDiscount;
+      fulfillmentMeta.goods_amount_before_coupon = goodsAmountBeforeCoupon;
+    }
     const row = await ServiceOrder.create({
       user_id: userId,
       community_id: commId,
       service_id: first.service_id,
       group_key: first.group_key || null,
       amount: total,
+      pay_amount: total,
+      platform_fee_rate: feeFields.platform_fee_rate,
+      platform_fee_amount: feeFields.platform_fee_amount,
+      settlement_amount: feeFields.settlement_amount,
       address_snapshot: {
         detail: address || '',
         contact_name: contact_name || '',
@@ -316,15 +396,25 @@ exports.createBundle = async (req, res) => {
       remark: remark || null,
       status: 'pending_pay',
       pay_status: 'unpaid',
-      provider_user_id: prof.user_id || parseInt(provider_id, 10),
+      provider_id: prof.id,
+      provider_user_id: prof.user_id,
       order_no: genOrderNo(),
       contact_name: contact_name || null,
       contact_phone: contact_phone || null,
       goods_name: `打包单(${lines.length}项)`,
       qty: 1,
-      fulfillment_meta: { bundle_lines: lines, mode: 'sp_bundle', await_user_confirm: true }
+      fulfillment_meta: fulfillmentMeta
     });
-    return ok(res, { id: row.id, order_no: row.order_no, status: row.status, amount: String(total) });
+    if (couponIssueId > 0) {
+      await couponService.markCouponUsed(couponIssueId, 'service', row.order_no || row.id);
+    }
+    return ok(res, {
+      id: row.id,
+      order_no: row.order_no,
+      status: row.status,
+      amount: String(total),
+      discount_amount: couponDiscount.toFixed(2)
+    });
   } catch (e) {
     console.error('serviceOrder createBundle', e);
     return fail(res, 500, '创建失败');
@@ -344,7 +434,7 @@ exports.getDetail = async (req, res) => {
       ]
     });
     if (!order) return fail(res, 404, '订单不存在', 404);
-    return ok(res, serializeOrderRow(order.get({ plain: true }), { withDetail: true }));
+    return ok(res, serializeOrderRow(order.get({ plain: true }), { withDetail: true, viewerUserId: userId }));
   } catch (e) {
     console.error('serviceOrder getDetail', e);
     return fail(res, 500, '查询失败');
@@ -364,7 +454,7 @@ exports.getByOrderNo = async (req, res) => {
       ]
     });
     if (!order) return fail(res, 404, '订单不存在', 404);
-    return ok(res, serializeOrderRow(order.get({ plain: true }), { withDetail: true }));
+    return ok(res, serializeOrderRow(order.get({ plain: true }), { withDetail: true, viewerUserId: userId }));
   } catch (e) {
     console.error('serviceOrder getByOrderNo', e);
     return fail(res, 500, '查询失败');
@@ -404,6 +494,39 @@ exports.confirmComplete = async (req, res) => {
     if (order.status !== 'pending_user_confirm') return fail(res, 400, '当前状态不可确认');
     order.status = 'completed';
     await order.save();
+
+    const orderSettlement = require('../services/orderSettlement.service');
+    const amt = orderSettlement.calcSettlementAmount(order);
+    const spUserId = order.provider_user_id || null;
+    if (amt > 0) {
+      try {
+        if (order.provider_id) {
+          await ServiceProviderProfile.increment('balance', {
+            by: amt,
+            where: { id: order.provider_id }
+          });
+        } else if (spUserId) {
+          await ServiceProviderProfile.increment('balance', {
+            by: amt,
+            where: { user_id: String(spUserId) }
+          });
+        }
+      } catch (e) {
+        console.error('confirmComplete SP balance increment', e);
+      }
+    }
+    try {
+      await orderSettlement.settleOrderComplete({
+        orderId: order.id,
+        orderType: 'service',
+        earnerUserId: spUserId,
+        earnerRole: 'service_provider',
+        settlementAmount: amt
+      });
+    } catch (e) {
+      console.error('confirmComplete settlement', e);
+    }
+
     return ok(res, { id: order.id, status: order.status, status_text: SERVICE_ORDER_STATUS_TEXT.completed });
   } catch (e) {
     console.error('serviceOrder confirmComplete', e);
@@ -429,7 +552,7 @@ exports.myList = async (req, res) => {
         { model: User, as: 'assignedWorker', attributes: ['id', 'nickname', 'avatar_url'], required: false }
       ]
     });
-    const list = rows.map((row) => serializeOrderRow(row.get({ plain: true })));
+    const list = rows.map((row) => serializeOrderRow(row.get({ plain: true }), { viewerUserId: userId }));
     return ok(res, { list, total: count, page, limit });
   } catch (e) {
     console.error('serviceOrder myList', e);
@@ -448,6 +571,28 @@ exports.mockPay = async (req, res) => {
     order.pay_status = 'paid';
     applyServiceOrderStatusAfterPayment(order);
     await order.save();
+    const payAmount = Number(order.pay_amount || order.amount || 0);
+    const pool = Number(order.platform_fee_amount || 0);
+    try {
+      if (payAmount > 0 && pool > 0) {
+        await commissionService.distributeCommission(
+          order.order_no || String(order.id),
+          'service',
+          payAmount,
+          userId,
+          pool
+        );
+      } else if (payAmount > 0) {
+        await commissionService.distributeCommission(
+          order.order_no || String(order.id),
+          'service',
+          payAmount,
+          userId
+        );
+      }
+    } catch (commErr) {
+      console.warn('serviceOrder mockPay commission', commErr.message);
+    }
     try {
       await Service.increment('sales_count', { by: 1, where: { id: order.service_id } });
       await Service.increment('order_count', { by: 1, where: { id: order.service_id } });
@@ -489,7 +634,12 @@ exports.providerListOrders = async (req, res) => {
       limit,
       offset
     });
-    return ok(res, { list: rows.map((r) => serializeOrderRow(r.get({ plain: true }))), total: count, page, limit });
+    return ok(res, {
+      list: rows.map((r) => serializeOrderRow(r.get({ plain: true }), { viewerUserId: userId })),
+      total: count,
+      page,
+      limit
+    });
   } catch (e) {
     console.error('serviceOrder providerListOrders', e);
     return fail(res, 500, '查询失败', 500);
@@ -506,7 +656,7 @@ exports.providerGetOrder = async (req, res) => {
     if (!id) return fail(res, 400, '无效订单 id');
     const order = await findProviderOrderById(id, profile, serviceIds);
     if (!order) return fail(res, 404, '订单不存在', 404);
-    return ok(res, serializeOrderRow(order.get({ plain: true }), { withDetail: true }));
+    return ok(res, serializeOrderRow(order.get({ plain: true }), { withDetail: true, viewerUserId: userId }));
   } catch (e) {
     console.error('serviceOrder providerGetOrder', e);
     return fail(res, 500, '查询失败', 500);

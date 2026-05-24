@@ -51,14 +51,22 @@
       <el-table-column prop="industry" label="行业" width="120" />
       <el-table-column prop="city" label="城市" width="100" />
       <el-table-column prop="status" label="状态" width="100" />
-      <el-table-column prop="created_at" label="申请时间" width="170" />
-      <el-table-column label="操作" width="180" fixed="right" v-if="status === 'pending' || status === ''">
+      <el-table-column label="服务项" min-width="140">
         <template #default="{ row }">
+          <span v-if="parseServices(row).length">{{ parseServices(row).length }} 项</span>
+          <span v-else class="muted">未填</span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="created_at" label="申请时间" width="170">
+        <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
+      </el-table-column>
+      <el-table-column label="操作" width="220" fixed="right">
+        <template #default="{ row }">
+          <el-button type="primary" link @click="openDetail(row)">详情</el-button>
           <template v-if="row.status === 'pending'">
             <el-button type="success" link @click="setStatus(row, 'approved')">通过</el-button>
-            <el-button type="danger" link @click="setStatus(row, 'rejected')">驳回</el-button>
+            <el-button type="danger" link @click="openReject(row)">驳回</el-button>
           </template>
-          <span v-else>—</span>
         </template>
       </el-table-column>
     </el-table>
@@ -74,6 +82,51 @@
         @current-change="load"
       />
     </div>
+
+    <el-dialog v-model="detailVisible" title="技工入驻申请详情" width="640px">
+      <el-descriptions v-if="detailRow" :column="1" border>
+        <el-descriptions-item label="姓名">{{ detailRow.name }}</el-descriptions-item>
+        <el-descriptions-item label="手机">{{ detailRow.phone }}</el-descriptions-item>
+        <el-descriptions-item label="行业">{{ detailRow.industry || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="学历">{{ detailRow.education || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="城市/籍贯">{{ detailRow.city || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="简历">{{ detailRow.resume || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="服务列表">
+          <div v-if="parseServices(detailRow).length">
+            <div v-for="(s, i) in parseServices(detailRow)" :key="i" class="svc-line">
+              <b>{{ s.name }}</b>
+              <span v-if="s.price" class="price">{{ s.price }}</span>
+              <div v-if="s.desc" class="svc-desc">{{ s.desc }}</div>
+            </div>
+          </div>
+          <span v-else class="muted">未填写</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="身份证照">
+          <el-image v-if="detailRow.id_card_url" :src="imgUrl(detailRow.id_card_url)" style="max-width:240px" fit="contain" :preview-src-list="[imgUrl(detailRow.id_card_url)]" />
+          <span v-else class="muted">未上传</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="工作生活照">
+          <el-image v-if="detailRow.work_photo_url" :src="imgUrl(detailRow.work_photo_url)" style="max-width:240px" fit="contain" :preview-src-list="[imgUrl(detailRow.work_photo_url)]" />
+          <span v-else class="muted">未上传</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="专业证书">
+          <div v-if="parseCerts(detailRow).length" class="cert-row">
+            <el-image v-for="(u, i) in parseCerts(detailRow)" :key="i" :src="imgUrl(u)" style="width:120px;margin-right:8px" fit="contain" :preview-src-list="parseCerts(detailRow).map(imgUrl)" />
+          </div>
+          <span v-else class="muted">未上传</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="状态">{{ detailRow.status }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailRow.reject_reason" label="驳回原因">{{ detailRow.reject_reason }}</el-descriptions-item>
+      </el-descriptions>
+    </el-dialog>
+
+    <el-dialog v-model="rejectVisible" title="驳回申请" width="480px">
+      <el-input v-model="rejectReason" type="textarea" :rows="3" placeholder="请填写驳回原因" />
+      <template #footer>
+        <el-button @click="rejectVisible = false">取消</el-button>
+        <el-button type="danger" @click="confirmReject">确认驳回</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -89,6 +142,74 @@ const total = ref(0)
 const page = ref(1)
 const limit = ref(10)
 const status = ref('pending')
+const detailVisible = ref(false)
+const detailRow = ref(null)
+const rejectVisible = ref(false)
+const rejectReason = ref('')
+const rejectTarget = ref(null)
+
+function fmtTime(d) {
+  if (!d) return '—'
+  const s = new Date(d).toLocaleString('zh-CN', { hour12: false })
+  return s === 'Invalid Date' ? String(d) : s
+}
+
+function imgUrl(path) {
+  if (!path) return ''
+  if (String(path).startsWith('http')) return path
+  const base = import.meta.env.VITE_API_BASE || '/api/v1'
+  const host = base.replace(/\/api\/v1\/?$/, '')
+  return host + (String(path).startsWith('/') ? path : '/' + path)
+}
+
+function parseServices(row) {
+  if (!row) return []
+  let s = row.services
+  if (typeof s === 'string') {
+    try { s = JSON.parse(s) } catch { s = [] }
+  }
+  return Array.isArray(s) ? s : []
+}
+
+function parseCerts(row) {
+  const out = []
+  const walk = (v) => {
+    if (v == null || v === '') return
+    if (Array.isArray(v)) return v.forEach(walk)
+    out.push(String(v))
+  }
+  walk(row && row.certificate_url)
+  return out
+}
+
+function openDetail(row) {
+  detailRow.value = row
+  detailVisible.value = true
+}
+
+function openReject(row) {
+  rejectTarget.value = row
+  rejectReason.value = row.reject_reason || ''
+  rejectVisible.value = true
+}
+
+async function confirmReject() {
+  if (!rejectReason.value.trim()) {
+    ElMessage.warning('请填写驳回原因')
+    return
+  }
+  try {
+    await request.put(`/admin/worker-applications/${rejectTarget.value.id}`, {
+      status: 'rejected',
+      note: rejectReason.value.trim()
+    })
+    ElMessage.success('已驳回')
+    rejectVisible.value = false
+    await load()
+  } catch (e) {
+    ElMessage.error(e.message || '驳回失败')
+  }
+}
 
 async function load() {
   loading.value = true
@@ -106,9 +227,11 @@ async function load() {
 }
 
 function setStatus(row, st) {
-  ElMessageBox.confirm(`确定将申请 #${row.id} 设为「${st === 'approved' ? '通过' : '驳回'}」？`, '确认', {
-    type: 'warning'
-  })
+  if (st === 'rejected') {
+    openReject(row)
+    return
+  }
+  ElMessageBox.confirm(`确定将申请 #${row.id} 设为「通过」？`, '确认', { type: 'warning' })
     .then(async () => {
       try {
         await request.put(`/admin/worker-applications/${row.id}`, { status: st })
@@ -246,4 +369,9 @@ onMounted(load)
   border-color: #1890ff !important;
   box-shadow: 0 4px 10px rgba(24,144,255,0.3) !important;
 }
+.muted { color: #bbb; font-size: 13px; }
+.svc-line { margin-bottom: 8px; }
+.svc-line .price { color: #e74c3c; margin-left: 8px; }
+.svc-desc { color: #999; font-size: 12px; }
+.cert-row { display: flex; flex-wrap: wrap; gap: 8px; }
 </style>

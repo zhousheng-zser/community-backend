@@ -24,4 +24,10 @@ router.get('/service-favorites', ctrl.getServiceFavs);
 router.post('/service-favorites/batch', ctrl.batchServiceFavs);
 router.get('/service-favorites/check', ctrl.checkServiceFav);
 
+// 用户社区绑定管理
+router.get('/community-bindings', ctrl.getUserCommunityBindings);
+router.post('/community-bindings', ctrl.bindCommunity);
+router.delete('/community-bindings/:communityId', ctrl.unbindCommunity);
+router.patch('/community-bindings/active', ctrl.switchActiveCommunity);
+
 module.exports = router;

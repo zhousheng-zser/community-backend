@@ -23,6 +23,16 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: true,
       comment: '店铺Logo'
     },
+    logo_url: {
+      type: DataTypes.STRING(500),
+      allowNull: true,
+      comment: '店铺Logo（别名）'
+    },
+    cover_url: {
+      type: DataTypes.STRING(500),
+      allowNull: true,
+      comment: '店铺封面'
+    },
     contact_name: {
       type: DataTypes.STRING(50),
       allowNull: true,

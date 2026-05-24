@@ -36,6 +36,7 @@ const routes = [
       { path: 'jd-benefit-goods', name: 'JdBenefitGoods', component: () => import('../views/JdBenefitGoods.vue'), meta: { title: '惠民卡·京东' } },
       { path: 'pdd-benefit-goods', name: 'PddBenefitGoods', component: () => import('../views/PddBenefitGoods.vue'), meta: { title: '惠民卡·拼多多' } },
       { path: 'benefit-display-config', name: 'BenefitDisplayConfig', component: () => import('../views/BenefitDisplayConfig.vue'), meta: { title: '惠民卡·运营位' } },
+      { path: 'community-management', name: 'CommunityManagement', component: () => import('../views/CommunityManagement.vue'), meta: { title: '小区管理' } },
       { path: 'community-featured', name: 'CommunityFeatured', component: () => import('../views/CommunityFeatured.vue'), meta: { title: '小区管家精选' } },
       { path: 'coupon-center', name: 'CouponCenter', component: () => import('../views/CouponCenter.vue'), meta: { title: '券码中心' } },
       { path: 'local-goods-home-ui-assets', name: 'LocalGoodsHomeUiAssets', component: () => import('../views/LocalGoodsHomeUiAssets.vue'), meta: { title: '本地商城运营图' } },

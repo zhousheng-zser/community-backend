@@ -198,7 +198,7 @@ async function handleUpload(options, item) {
   const token = localStorage.getItem('admin_token')
   const base = import.meta.env.VITE_API_BASE || '/api/v1'
   try {
-    const res = await axios.post(`${base}/upload`, formData, {
+    const res = await axios.post(`${base}/upload?scene=general`, formData, {
       headers: token ? { Authorization: `Bearer ${token}` } : {}
     })
     const body = res.data

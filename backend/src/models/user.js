@@ -10,6 +10,7 @@ module.exports = (sequelize, DataTypes) => {
       User.hasMany(models.Like, { foreignKey: 'user_id', as: 'likes' });
       User.hasMany(models.User, { foreignKey: 'invited_by', as: 'invitees' });
       User.belongsTo(models.User, { foreignKey: 'invited_by', as: 'inviter' });
+      User.hasMany(models.UserCommunityBinding, { foreignKey: 'user_id', as: 'communityBindings' });
     }
   }
   User.init(
@@ -29,7 +30,7 @@ module.exports = (sequelize, DataTypes) => {
       wx_id: DataTypes.STRING,
       role: DataTypes.STRING,
       balance: DataTypes.DECIMAL(10, 2),
-      community_id: DataTypes.INTEGER,
+      community_id: DataTypes.BIGINT,
       token_version: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
       invite_code: { type: DataTypes.STRING(16), allowNull: true },
       invited_by: { type: DataTypes.BIGINT, allowNull: true }

@@ -13,6 +13,7 @@ router.get('/profile', userController.getProfile);
 // 更新个人资料 (支持上传头像)
 // 'avatar' 是前端上传文件的字段名
 router.post('/profile', upload.single('avatar'), userController.updateProfile);
+router.patch('/profile', userController.updateProfile);
 
 // 兼容性的旧路径接口 (前端中有些地方调用的是 api/user_info/update)
 router.post('/api/user_info/update', userController.updateProfile);
@@ -34,6 +35,10 @@ router.post('/footprints/batch', fpCtrl.batchFootprints);
 router.get('/footprints', fpCtrl.getFootprints);
 router.delete('/footprints', fpCtrl.clearFootprints);
 
+// 邀请系统
+router.get('/invite-code', userController.getInviteCode);
+router.post('/bind-inviter', userController.bindInviter);
+router.get('/invitees', userController.getInvitees);
 
 // 服务/服务商收藏
 router.post('/service-favorites', fpCtrl.addServiceFav);
@@ -42,9 +47,10 @@ router.get('/service-favorites', fpCtrl.getServiceFavs);
 router.post('/service-favorites/batch', fpCtrl.batchServiceFavs);
 router.get('/service-favorites/check', fpCtrl.checkServiceFav);
 
-module.exports = router;
+// 用户社区绑定管理
+router.get('/community-bindings', fpCtrl.getUserCommunityBindings);
+router.post('/community-bindings', fpCtrl.bindCommunity);
+router.delete('/community-bindings/:communityId', fpCtrl.unbindCommunity);
+router.patch('/community-bindings/active', fpCtrl.switchActiveCommunity);
 
-// 邀请系统
-router.get('/invite-code', userController.getInviteCode);
-router.post('/bind-inviter', userController.bindInviter);
-router.get('/invitees', userController.getInvitees);
+module.exports = router;

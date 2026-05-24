@@ -18,14 +18,18 @@ module.exports = (sequelize, DataTypes) => {
   }
   Comment.init({
     post_id: DataTypes.INTEGER,
-    user_id: DataTypes.INTEGER,
+    user_id: DataTypes.BIGINT,
     content: DataTypes.TEXT,
-    reply_to_user_id: DataTypes.INTEGER,
-    image_urls: DataTypes.JSON // 评论所附带的图片数组(至多3张)
+    reply_to_user_id: DataTypes.BIGINT,
+    image_urls: DataTypes.JSON
   }, {
     sequelize,
     modelName: 'Comment',
-    tableName: 'Comments',
+    tableName: 'comments',
+    underscored: false,
+    timestamps: true,
+    createdAt: 'createdAt',
+    updatedAt: 'updatedAt'
   });
   return Comment;
 };

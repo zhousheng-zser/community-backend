@@ -22,13 +22,15 @@
     "migrate:market-o2o": "node scripts/run-market-o2o-migration.js",
     "migrate:users-snowflake": "node scripts/migrate-users-to-snowflake-id.js",
     "migrate:service-home": "node scripts/run-service-home-modules-migration.js",
+    "migrate:home-display": "node scripts/run-home-display-migration.js",
     "test": "node scripts/e2e-cw-fullflow.js",
     "test:e2e:cw": "node scripts/e2e-cw-fullflow.js",
     "simulate:home-chain": "node scripts/simulate-home-service-chain.js",
     "lint": "node scripts/node-syntax-check.js",
     "typecheck": "node -e \"console.log('[typecheck] 后端为纯 JS，未配置 tsc'); process.exit(0)\"",
     "e2e:home": "E2E_CHILD_PORT=3099 node scripts/e2e-home-service-test.js",
-    "test:virtual-dispatch": "node scripts/virtual-service-order-dispatch-test.js"
+    "test:virtual-dispatch": "node scripts/virtual-service-order-dispatch-test.js",
+    "backfill:worker-links": "node scripts/backfill-worker-user-community.js"
   },
   "keywords": [],
   "author": "",

@@ -472,3 +472,190 @@ exports.checkServiceFav = async (req, res) => {
     fail(res, '查询失败', 500);
   }
 };
+
+// ========== 用户社区绑定管理 ==========
+
+const { UserCommunityBinding, Community } = require('../../../models');
+
+// GET /user/community-bindings - 获取用户绑定列表
+exports.getUserCommunityBindings = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id ? String(req.user.id) : null;
+    if (!userId) return fail(res, '未登录', 401);
+
+    // 获取用户当前选用的小区
+    const user = await User.findByPk(userId, {
+      attributes: ['id', 'community_id']
+    });
+    if (!user) return fail(res, '用户不存在', 404);
+
+    // 获取用户绑定的所有小区
+    const bindings = await UserCommunityBinding.findAll({
+      where: { user_id: userId },
+      include: [{
+        model: Community,
+        as: 'community',
+        attributes: ['id', 'name', 'address', 'city', 'district', 'latitude', 'longitude', 'status']
+      }],
+      order: [['created_at', 'ASC']]
+    });
+
+    const list = bindings.map(binding => {
+      const community = binding.community;
+      return {
+        community_id: community.id,
+        name: community.name,
+        address: community.address,
+        city: community.city,
+        district: community.district,
+        latitude: community.latitude,
+        longitude: community.longitude,
+        is_active: user.community_id === community.id
+      };
+    });
+
+    ok(res, {
+      list,
+      active_community_id: user.community_id
+    });
+  } catch (err) {
+    console.error('[user/community-bindings] get', err);
+    fail(res, '获取绑定列表失败', 500);
+  }
+};
+
+// POST /user/community-bindings - 绑定小区
+exports.bindCommunity = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id ? String(req.user.id) : null;
+    if (!userId) return fail(res, '未登录', 401);
+
+    const { community_id } = req.body;
+    if (!community_id || !Number.isFinite(parseInt(community_id, 10))) {
+      return fail(res, '无效的小区 ID');
+    }
+
+    const cid = parseInt(community_id, 10);
+
+    // 检查小区是否存在且为 active
+    const community = await Community.findByPk(cid, {
+      attributes: ['id', 'status']
+    });
+    if (!community || community.status !== 'active') {
+      return fail(res, '小区不存在或已停用');
+    }
+
+    // 检查是否已绑定
+    const existingBinding = await UserCommunityBinding.findOne({
+      where: { user_id: userId, community_id: cid }
+    });
+    if (existingBinding) {
+      return fail(res, '已绑定该小区', 409);
+    }
+
+    // 检查绑定数量是否已满（最多 3 个）
+    const bindingCount = await UserCommunityBinding.count({
+      where: { user_id: userId }
+    });
+    if (bindingCount >= 3) {
+      return fail(res, '最多绑定 3 个小区');
+    }
+
+    // 创建绑定
+    const binding = await UserCommunityBinding.create({
+      user_id: userId,
+      community_id: cid
+    });
+
+    // 如果用户没有当前选用小区，自动设置
+    const user = await User.findByPk(userId);
+    if (!user.community_id) {
+      user.community_id = cid;
+      await user.save();
+    }
+
+    ok(res, {
+      binding_id: binding.id,
+      community_id: cid
+    }, '绑定成功');
+  } catch (err) {
+    console.error('[user/community-bindings] bind', err);
+    fail(res, '绑定失败', 500);
+  }
+};
+
+// DELETE /user/community-bindings/:communityId - 解绑小区
+exports.unbindCommunity = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id ? String(req.user.id) : null;
+    if (!userId) return fail(res, '未登录', 401);
+
+    const communityId = parseInt(req.params.communityId, 10);
+    if (!Number.isFinite(communityId) || communityId <= 0) {
+      return fail(res, '无效的小区 ID');
+    }
+
+    // 查找绑定记录
+    const binding = await UserCommunityBinding.findOne({
+      where: { user_id: userId, community_id: communityId }
+    });
+    if (!binding) {
+      return fail(res, '未绑定该小区', 404);
+    }
+
+    // 删除绑定
+    await binding.destroy();
+
+    // 如果解绑的是当前选用小区，需要更新用户当前选用
+    const user = await User.findByPk(userId);
+    if (user.community_id === communityId) {
+      // 查找剩余绑定
+      const remainingBinding = await UserCommunityBinding.findOne({
+        where: { user_id: userId },
+        order: [['created_at', 'ASC']]
+      });
+      user.community_id = remainingBinding ? remainingBinding.community_id : null;
+      await user.save();
+    }
+
+    ok(res, null, '解绑成功');
+  } catch (err) {
+    console.error('[user/community-bindings] unbind', err);
+    fail(res, '解绑失败', 500);
+  }
+};
+
+// PATCH /user/community-bindings/active - 切换当前选用小区
+exports.switchActiveCommunity = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id ? String(req.user.id) : null;
+    if (!userId) return fail(res, '未登录', 401);
+
+    const { community_id } = req.body;
+    if (!community_id || !Number.isFinite(parseInt(community_id, 10))) {
+      return fail(res, '无效的小区 ID');
+    }
+
+    const cid = parseInt(community_id, 10);
+
+    // 检查是否已绑定该小区
+    const binding = await UserCommunityBinding.findOne({
+      where: { user_id: userId, community_id: cid }
+    });
+    if (!binding) {
+      return fail(res, '未绑定该小区');
+    }
+
+    // 更新用户当前选用小区
+    const user = await User.findByPk(userId);
+    if (!user) return fail(res, '用户不存在', 404);
+
+    user.community_id = cid;
+    await user.save();
+
+    ok(res, { community_id: cid }, '切换成功');
+  } catch (err) {
+    console.error('[user/community-bindings] switch', err);
+    fail(res, '切换失败', 500);
+  }
+};

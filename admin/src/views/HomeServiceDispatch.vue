@@ -11,7 +11,7 @@
               <el-table v-loading="loadingQueue" :data="queueService" border stripe size="small" max-height="420">
                 <el-table-column prop="id" label="ID" width="72" />
                 <el-table-column label="服务" min-width="140">
-                  <template #default="{ row }">{{ row.service?.title || '-' }}</template>
+                  <template #default="{ row }">{{ row.service_title || row.service?.title || '-' }}</template>
                 </el-table-column>
                 <el-table-column label="用户" min-width="120">
                   <template #default="{ row }">
@@ -177,15 +177,28 @@
           <span v-if="assignKind === 'service'">到家服务 #{{ assignRow?.id }}</span>
           <span v-else>帮帮 #{{ assignRow?.id }}（{{ assignRow?.assist_type }}）</span>
         </el-form-item>
+        <el-form-item label="服务小区">
+          <span v-if="assignRow?.community_id != null">小区 ID {{ assignRow.community_id }}</span>
+          <span v-else class="muted">未填写小区，将展示全部已入驻技工</span>
+        </el-form-item>
         <el-form-item label="技工">
-          <el-select v-model="assignWorkerId" filterable placeholder="选择技工（用户 ID）" style="width: 100%">
+          <el-select
+            v-model="assignWorkerId"
+            filterable
+            :loading="loadingWorkers"
+            :placeholder="workerSelectPlaceholder"
+            style="width: 100%"
+          >
             <el-option
               v-for="w in workers"
-              :key="w.id"
-              :label="`${w.name} / ${w.industry || '—'} / ${w.phone || '无手机'} (#${w.id})`"
-              :value="w.id"
+              :key="String(w.user_id || w.id)"
+              :label="`${w.name} / ${w.industry || '—'} / ${w.phone || '无手机'} (#${w.user_id || w.id})`"
+              :value="String(w.user_id || w.id)"
             />
           </el-select>
+          <p v-if="!loadingWorkers && workers.length === 0" class="muted" style="margin-top: 6px">
+            该小区暂无已审核技工，请先在「技工入驻」审核并绑定小区
+          </p>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -218,6 +231,8 @@ const nbCommunityId = ref('')
 const neighborRows = ref([])
 
 const workers = ref([])
+const loadingWorkers = ref(false)
+const workerSelectPlaceholder = ref('选择技工（用户 ID）')
 const assignVisible = ref(false)
 const assignKind = ref('service')
 const assignRow = ref(null)
@@ -244,10 +259,118 @@ function pretty(obj) {
   }
 }
 
-async function loadWorkers() {
-  const res = await request.get('/admin/housekeeping/workers')
-  const data = res.data != null ? res.data : res
-  workers.value = Array.isArray(data) ? data : []
+function unwrapAdminList(res) {
+  if (!res) return []
+  if (Array.isArray(res)) return res
+  if (Array.isArray(res.data)) return res.data
+  if (res.data && Array.isArray(res.data.rows)) return res.data.rows
+  if (res.data && Array.isArray(res.data.list)) return res.data.list
+  return []
+}
+
+function normalizeWorkerOption(row, fallbackCommunityId) {
+  const uid = row.user_id != null && row.user_id !== '' ? row.user_id : row.id
+  if (uid == null || uid === '') return null
+  return {
+    id: String(uid),
+    user_id: String(uid),
+    name: row.name || row.real_name || row.nickname || row.user?.nickname || '技工',
+    phone: row.phone || row.user?.phone || '',
+    industry: row.industry || '',
+    community_id: row.community_id != null ? row.community_id : row.user?.community_id ?? fallbackCommunityId
+  }
+}
+
+/** 兼容旧后端：从技工入驻申请列表拼装下拉 */
+async function loadWorkersFromApplications(communityId) {
+  const res = await request.get('/admin/worker-applications', {
+    params: { status: 'approved', limit: 100 }
+  })
+  const rows = unwrapAdminList(res)
+  const cid = communityId != null && communityId !== '' ? Number(communityId) : null
+
+  function buildList(strictCommunity) {
+    const out = []
+    for (const r of rows) {
+      const comm =
+        r.community_id != null
+          ? Number(r.community_id)
+          : r.user?.community_id != null
+            ? Number(r.user.community_id)
+            : null
+      if (strictCommunity && cid != null && comm != null && comm !== cid) continue
+      const item = normalizeWorkerOption(
+        {
+          user_id: r.user_id || r.user?.id,
+          id: r.user_id || r.user?.id,
+          name: r.name || r.real_name,
+          phone: r.phone,
+          industry: r.industry,
+          community_id: comm,
+          user: r.user
+        },
+        communityId
+      )
+      if (item) out.push(item)
+    }
+    return out
+  }
+
+  let list = buildList(true)
+  if (!list.length && cid != null) list = buildList(false)
+  return list
+}
+
+async function loadWorkers(communityId) {
+  loadingWorkers.value = true
+  workers.value = []
+  try {
+    const params = { limit: 200 }
+    if (communityId != null && communityId !== '') params.community_id = communityId
+    let list = []
+
+    // 直接调用已稳定的 housekeeping/workers 接口（内部使用 WorkerProfile 查询）
+    try {
+      const res = await request.get('/admin/housekeeping/workers', { params })
+      list = unwrapAdminList(res).map((row) => normalizeWorkerOption(row, communityId)).filter(Boolean)
+    } catch (e1) {
+      console.warn('[dispatch] housekeeping/workers failed, fallback to applications', e1.message)
+    }
+
+    // 若无结果，放宽社区限制再试一次
+    if (!list.length && communityId != null && communityId !== '') {
+      try {
+        const res2 = await request.get('/admin/housekeeping/workers', { params: { limit: 200 } })
+        list = unwrapAdminList(res2).map((row) => normalizeWorkerOption(row, communityId)).filter(Boolean)
+      } catch (_) { /* ignore */ }
+    }
+
+    // 最终回退：从技工申请列表取
+    if (!list.length) {
+      list = await loadWorkersFromApplications(communityId)
+    }
+
+    workers.value = list
+    workerSelectPlaceholder.value =
+      communityId != null && communityId !== ''
+        ? list.length
+          ? `选择小区 ${communityId} 的技工（${list.length} 人）`
+          : `小区 ${communityId} 暂无可派技工`
+        : `选择技工（共 ${list.length} 人）`
+    if (!list.length) {
+      ElMessage.warning(
+        communityId != null && communityId !== ''
+          ? `小区 ${communityId} 暂无技工，请先在「技工入驻」审核并绑定该小区`
+          : '暂无技工，请先审核技工入驻'
+      )
+    }
+  } catch (e) {
+    console.error('[loadWorkers]', e)
+    ElMessage.error(e.message || '加载技工列表失败')
+    workers.value = []
+  } finally {
+    loadingWorkers.value = false
+  }
 }
 
 async function loadQueue() {
@@ -300,11 +423,15 @@ function onTabChange(name) {
   if (name === 'neighbor') loadNeighborList()
 }
 
-function openAssign(kind, row) {
+async function openAssign(kind, row) {
   assignKind.value = kind
   assignRow.value = row
-  assignWorkerId.value = row.assigned_worker_id || null
+  assignWorkerId.value =
+    row.assigned_worker_id != null && row.assigned_worker_id !== ''
+      ? String(row.assigned_worker_id)
+      : null
   assignVisible.value = true
+  await loadWorkers(row.community_id)
 }
 
 async function submitAssign() {
@@ -333,7 +460,6 @@ async function submitAssign() {
 }
 
 onMounted(async () => {
-  await loadWorkers()
   await loadQueue()
 })
 </script>

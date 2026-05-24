@@ -2,10 +2,11 @@ const express = require('express');
 const router = express.Router();
 const optionalAuth = require('../middlewares/optionalAuthMiddleware');
 const ctrl = require('../controllers/coreDataController');
-const coreCommunities = require('../modules/core/controllers/core.controller').getCommunities;
+const communityList = require('../controllers/communityListController');
 
 router.get('/banners', ctrl.getBanners);
-router.get('/communities', coreCommunities);
+router.get('/communities', communityList.getCommunities);
+router.post('/communities/resolve', communityList.resolveCommunity);
 router.get('/categories', ctrl.getCategories);
 router.get('/community/hot', optionalAuth, ctrl.getCommunityHot);
 router.get('/services/hot', ctrl.getHotServices);

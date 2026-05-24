@@ -285,7 +285,7 @@ import { ref, onMounted, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import request from '../utils/request'
 
-const uploadAction = `${import.meta.env.VITE_API_BASE || '/api/v1'}/upload`
+const uploadAction = `${import.meta.env.VITE_API_BASE || '/api/v1'}/upload?scene=general`
 
 const uploadHeaders = computed(() => {
   const token = localStorage.getItem('admin_token')

@@ -4,11 +4,14 @@
 
 const { Op } = require('sequelize');
 const db = require('../../../models');
+const { parseNeighborAppointmentTime } = require('../../../utils/parseNeighborAppointmentTime');
 
 const NeighborAssistOrder = db.NeighborAssistOrder;
 const User = db.User;
 const WorkerApplication = db.WorkerApplication;
 const orderPoints = require('../../../services/orderPoints.service');
+const commissionService = require('../../commission/services/commission.service');
+const { resolveUserIdFromReq } = require('../../../utils/resolveUserId');
 // WorkerProfile 可能由主后端提供，当前环境缺失时降级处理
 const WorkerProfile = db.WorkerProfile || null;
 
@@ -39,6 +42,31 @@ const NEIGHBOR_ORDER_STATUS_TEXT = {
   closed: '已关闭'
 };
 
+function normalizeProofImages(raw) {
+  if (!raw) return [];
+  const arr = Array.isArray(raw) ? raw : (typeof raw === 'string' ? (() => {
+    try { return JSON.parse(raw); } catch (e) { return []; }
+  })() : []);
+  return arr
+    .map((u) => (u != null ? String(u).trim() : ''))
+    .filter((u) => u && (u.startsWith('http') || u.startsWith('/')));
+}
+
+function parseProofImagesField(row) {
+  const v = row && row.completion_proof_images;
+  if (!v) return [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') {
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
+  }
+  return [];
+}
+
 async function assertWorker(userId) {
   const app = await WorkerApplication.findOne({ where: { user_id: userId, status: 'approved' } });
   if (!app) return false;
@@ -61,7 +89,7 @@ async function assertWorkerCanTakeOrder(workerUserId, order) {
 // POST /neighbor-assist/orders
 exports.create = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
 
     const {
@@ -77,8 +105,9 @@ exports.create = async (req, res) => {
       contact_phone
     } = req.body;
 
-    if (!assist_type) {
-      return fail(res, 400, '缺少 assist_type');
+    const assistType = String(assist_type || '').trim();
+    if (!assistType || assistType.length > 32) {
+      return fail(res, 400, '请选择或填写服务类型');
     }
 
     let commId = community_id != null ? parseInt(community_id, 10) : null;
@@ -86,26 +115,40 @@ exports.create = async (req, res) => {
       const u = await User.findByPk(userId, { attributes: ['community_id'] });
       commId = u && u.community_id != null ? Number(u.community_id) : null;
     }
+    if (!commId || !Number.isFinite(commId) || commId <= 0) {
+      return fail(res, 400, '请先在「我的」绑定小区后再发布');
+    }
 
-    // 支持前端传 reward_amount 或 amount
     const orderAmount = (reward_amount != null ? reward_amount : amount) != null
       ? String(reward_amount != null ? reward_amount : amount) : null;
 
-    const finalRemark = remark || content || null;
+    const phone = contact_phone != null ? String(contact_phone).trim() : '';
+    const bodyContent = content != null ? String(content).trim() : '';
+    let finalRemark = remark != null ? String(remark).trim() : '';
+    if (bodyContent && !finalRemark.includes(bodyContent)) {
+      finalRemark = finalRemark ? `${bodyContent}\n${finalRemark}` : bodyContent;
+    }
+    if (phone) {
+      finalRemark = finalRemark ? `${finalRemark}\n联系电话：${phone}` : `联系电话：${phone}`;
+    }
+
+    const appt = parseNeighborAppointmentTime(appointment_time);
 
     if (!NeighborAssistOrder) {
       return fail(res, 500, 'NeighborAssistOrder 模型未加载');
     }
 
     const row = await NeighborAssistOrder.create({
-      assist_type: String(assist_type),
+      assist_type: assistType,
       user_id: userId,
       community_id: commId,
       origin_address_snapshot: origin_address_snapshot || { address: '', detail: '' },
       destination_address_snapshot: destination_address_snapshot || { address: '', detail: '' },
       amount: orderAmount,
-      appointment_time: appointment_time || null,
-      remark: finalRemark,
+      appointment_time: appt,
+      content: bodyContent || finalRemark || null,
+      remark: finalRemark || bodyContent || null,
+      contact_phone: phone || null,
       status: 'pending_pay',
       pay_status: 'unpaid'
     });
@@ -128,7 +171,7 @@ exports.create = async (req, res) => {
 // GET /neighbor-assist/orders/my
 exports.myList = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
 
     const role = req.query.role || 'publisher';
@@ -195,7 +238,7 @@ exports.myList = async (req, res) => {
 // POST /neighbor-assist/orders/:id/pay
 exports.mockPay = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
@@ -224,7 +267,7 @@ exports.mockPay = async (req, res) => {
 // GET /neighbor-assist/orders/pool
 exports.pool = async (req, res) => {
   try {
-    const workerId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const workerId = resolveUserIdFromReq(req);
     if (!workerId) return fail(res, 401, '未登录', 401);
     if (!(await assertWorker(workerId))) return fail(res, 403, '非已入驻技工', 403);
 
@@ -291,7 +334,7 @@ exports.pool = async (req, res) => {
 // GET /neighbor-assist/orders/community-pool
 exports.communityPool = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
     const user = await User.findByPk(userId, { attributes: ['id', 'nickname', 'avatar_url', 'phone', 'community_id'] });
     if (!user) return fail(res, 404, '用户不存在');
@@ -347,7 +390,7 @@ exports.communityPool = async (req, res) => {
 // POST /neighbor-assist/orders/:id/grab
 exports.grab = async (req, res) => {
   try {
-    const workerId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const workerId = resolveUserIdFromReq(req);
     if (!workerId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
@@ -385,7 +428,7 @@ exports.grab = async (req, res) => {
 // POST /neighbor-assist/orders/:id/community-grab
 exports.communityGrab = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
@@ -421,10 +464,63 @@ exports.communityGrab = async (req, res) => {
   }
 };
 
+// POST /neighbor-assist/orders/:id/check-in
+exports.checkIn = async (req, res) => {
+  try {
+    const helperId = resolveUserIdFromReq(req);
+    if (!helperId) return fail(res, 401, '未登录', 401);
+    const id = parseInt(req.params.id, 10);
+    if (!id) return fail(res, 400, '无效订单 id');
+    const body = req.body || {};
+    const latitude = body.latitude != null ? Number(body.latitude) : null;
+    const longitude = body.longitude != null ? Number(body.longitude) : null;
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return fail(res, 400, '缺少有效 latitude / longitude');
+    }
+
+    const order = await NeighborAssistOrder.findByPk(id);
+    if (!order) return fail(res, 404, '订单不存在', 404);
+    if (order.assigned_worker_id !== helperId) return fail(res, 403, '无权限操作该订单', 403);
+    if (order.pay_status !== 'paid') return fail(res, 400, '订单未支付');
+    if (!['dispatched', 'in_service'].includes(String(order.status))) {
+      return fail(res, 400, '当前状态不可打卡');
+    }
+
+    const checkInAt = order.check_in_at || new Date();
+    await order.update({
+      status: 'in_service',
+      check_in_at: checkInAt,
+      check_in_lat: latitude,
+      check_in_lng: longitude
+    });
+
+    try {
+      const messageCtrl = require('../../message/controllers/message.controller');
+      if (messageCtrl.seedNeighborAssistCheckInMessage) {
+        await messageCtrl.seedNeighborAssistCheckInMessage(id, helperId);
+      }
+    } catch (chatErr) {
+      console.warn('neighborAssist checkIn chat seed', chatErr.message);
+    }
+
+    return ok(res, {
+      id: order.id,
+      status: 'in_service',
+      status_text: NEIGHBOR_ORDER_STATUS_TEXT.in_service,
+      check_in_at: checkInAt,
+      check_in_lat: latitude,
+      check_in_lng: longitude
+    }, '打卡成功');
+  } catch (e) {
+    console.error('neighborAssist checkIn', e);
+    return fail(res, 500, '打卡失败', 500);
+  }
+};
+
 // POST /neighbor-assist/orders/:id/accept
 exports.accept = async (req, res) => {
   try {
-    const workerId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const workerId = resolveUserIdFromReq(req);
     if (!workerId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
@@ -445,45 +541,34 @@ exports.accept = async (req, res) => {
 // POST /neighbor-assist/orders/:id/complete
 exports.complete = async (req, res) => {
   try {
-    const workerId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const workerId = resolveUserIdFromReq(req);
     if (!workerId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
+    const body = req.body || {};
+    const proofImages = normalizeProofImages(body.proof_images || body.completion_proof_images);
+    if (!proofImages.length) {
+      return fail(res, 400, '请上传至少 1 张服务完成凭证照片');
+    }
+
     const order = await NeighborAssistOrder.findByPk(id);
     if (!order) return fail(res, 404, '订单不存在', 404);
     if (order.assigned_worker_id !== workerId) return fail(res, 403, '无权限操作该订单', 403);
-    if (order.status !== 'in_service' && order.status !== 'dispatched') return fail(res, 400, '当前状态不可完成');
+    if (order.status !== 'in_service') return fail(res, 400, '当前状态不可完成');
+    if (!order.check_in_at) return fail(res, 400, '请先完成上门打卡');
 
-    const t = await db.sequelize.transaction();
-    try {
-      const amountNum = Number(order.amount || 0);
-      if (amountNum > 0) {
-        const publisher = await User.findByPk(order.user_id, { transaction: t });
-        if (publisher && publisher.balance != null) {
-          await publisher.decrement('balance', { by: amountNum, transaction: t });
-        }
-        const helper = await User.findByPk(order.assigned_worker_id, { transaction: t });
-        if (helper && helper.balance != null) {
-          await helper.increment('balance', { by: amountNum, transaction: t });
-        }
-      }
+    order.completion_proof_images = proofImages;
+    order.status = 'pending_confirm';
+    order.completed_at = new Date();
+    await order.save();
 
-      order.status = 'completed';
-      order.completed_at = new Date();
-      await order.save({ transaction: t });
-      await t.commit();
-
-      return ok(res, {
-        id: order.id,
-        status: order.status,
-        status_text: NEIGHBOR_ORDER_STATUS_TEXT[order.status] || order.status,
-        amount_transferred: amountNum,
-        completed_at: order.completed_at
-      });
-    } catch (e) {
-      await t.rollback();
-      throw e;
-    }
+    return ok(res, {
+      id: order.id,
+      status: order.status,
+      status_text: NEIGHBOR_ORDER_STATUS_TEXT[order.status] || order.status,
+      completion_proof_images: proofImages,
+      completed_at: order.completed_at
+    });
   } catch (e) {
     console.error('neighborAssist complete', e);
     return fail(res, 500, '操作失败');
@@ -493,7 +578,7 @@ exports.complete = async (req, res) => {
 // POST /neighbor-assist/orders/:id/cancel
 exports.cancel = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
@@ -514,7 +599,7 @@ exports.cancel = async (req, res) => {
 // POST /neighbor-assist/orders/:id/reject
 exports.reject = async (req, res) => {
   try {
-    const workerId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const workerId = resolveUserIdFromReq(req);
     if (!workerId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
@@ -537,7 +622,7 @@ exports.reject = async (req, res) => {
 // GET /neighbor-assist/orders/:id
 exports.detail = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
     const orderId = parseInt(req.params.id, 10);
     if (!Number.isFinite(orderId)) return fail(res, 400, '无效订单ID');
@@ -558,12 +643,15 @@ exports.detail = async (req, res) => {
     const isHelper = order.assigned_worker_id === userId;
     const myRole = isPublisher ? 'publisher' : isHelper ? 'helper' : '';
 
+    const completionProofImages = parseProofImagesField(plain);
+
     const resp = {
       ...plain,
       assist_type_label: ASSIST_TYPE_LABELS[plain.assist_type] || plain.assist_type,
       status_text: NEIGHBOR_ORDER_STATUS_TEXT[plain.status] || plain.status,
       amount: plain.amount != null ? String(plain.amount) : '',
       reward_amount: plain.amount != null ? String(plain.amount) : '',
+      completion_proof_images: completionProofImages,
       publisher: pub ? { id: pub.id, nickname: pub.nickname, phone: pub.phone, avatar_url: pub.avatar_url } : null,
       helper: worker ? { id: worker.id, nickname: worker.nickname, phone: worker.phone, avatar_url: worker.avatar_url } : null,
       my_role: myRole
@@ -584,14 +672,42 @@ exports.detail = async (req, res) => {
 // POST /neighbor-assist/orders/:id/confirm
 exports.confirm = async (req, res) => {
   try {
-    const userId = req.user && req.user.id ? Number(req.user.id) : 0;
+    const userId = resolveUserIdFromReq(req);
     if (!userId) return fail(res, 401, '未登录', 401);
     const id = parseInt(req.params.id, 10);
     if (!id) return fail(res, 400, '无效订单 id');
     const order = await NeighborAssistOrder.findOne({ where: { id, user_id: userId } });
     if (!order) return fail(res, 404, '订单不存在');
-    if (order.status !== 'completed') return fail(res, 400, '订单未完成，无法确认');
-    return ok(res, { id: order.id, status: order.status, confirmed: true, status_text: NEIGHBOR_ORDER_STATUS_TEXT[order.status] || order.status });
+    if (order.status === 'completed') {
+      return ok(res, { id: order.id, status: order.status, confirmed: true, status_text: NEIGHBOR_ORDER_STATUS_TEXT[order.status] || order.status });
+    }
+    if (order.status !== 'pending_confirm') return fail(res, 400, '当前状态不可确认');
+
+    order.status = 'completed';
+    if (!order.completed_at) order.completed_at = new Date();
+    await order.save();
+
+    const orderSettlement = require('../../../services/orderSettlement.service');
+    const settleNum = orderSettlement.calcSettlementAmount(order);
+    try {
+      await orderSettlement.settleOrderComplete({
+        orderId: order.id,
+        orderType: 'neighbor_assist',
+        earnerUserId: order.assigned_worker_id,
+        earnerRole: 'neighbor_assist',
+        settlementAmount: settleNum
+      });
+    } catch (se) {
+      console.warn('[neighbor-assist/confirm/settlement]', se.message);
+    }
+
+    return ok(res, {
+      id: order.id,
+      status: order.status,
+      confirmed: true,
+      status_text: NEIGHBOR_ORDER_STATUS_TEXT[order.status] || order.status,
+      amount_transferred: settleNum
+    });
   } catch (e) {
     console.error('neighborAssist confirm', e);
     return fail(res, 500, '操作失败');

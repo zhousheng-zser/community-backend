@@ -4,7 +4,7 @@ const { sequelize, Sequelize } = require("./src/models");
 async function main() {
     try {
         // 1. Add group_type column if not exists
-        await sequelize.query("ALTER TABLE Categories ADD COLUMN group_type VARCHAR(50) DEFAULT NULL").catch(() => {});
+        await sequelize.query("ALTER TABLE categories ADD COLUMN group_type VARCHAR(50) DEFAULT NULL").catch(() => {});
         console.log("Column group_type ensured");
 
         const serviceGroups = {
@@ -159,7 +159,7 @@ async function main() {
 
                 for (const cat of groupData.categories) {
                     const rows = await sequelize.query(
-                        "SELECT id FROM Categories WHERE name=? AND group_type=? LIMIT 1",
+                        "SELECT id FROM categories WHERE name=? AND group_type=? LIMIT 1",
                         { replacements: [cat.name, groupKey], type: Sequelize.QueryTypes.SELECT, transaction: t }
                     );
                     if (rows.length > 0) {
@@ -167,11 +167,11 @@ async function main() {
                         console.log("Category exists: " + cat.name + " (" + groupKey + ") id=" + rows[0].id);
                     } else {
                         await sequelize.query(
-                            "INSERT INTO Categories (name, icon_url, sort_order, group_type, createdAt, updatedAt) VALUES (?,?,?,?,NOW(),NOW())",
+                            "INSERT INTO categories (name, icon_url, sort_order, group_type, createdAt, updatedAt) VALUES (?,?,?,?,NOW(),NOW())",
                             { replacements: [cat.name, cat.icon_url, cat.sort_order, groupKey], transaction: t }
                         );
                         const newRows = await sequelize.query(
-                            "SELECT id FROM Categories WHERE name=? AND group_type=? LIMIT 1",
+                            "SELECT id FROM categories WHERE name=? AND group_type=? LIMIT 1",
                             { replacements: [cat.name, groupKey], type: Sequelize.QueryTypes.SELECT, transaction: t }
                         );
                         catMap[cat.name] = newRows[0].id;
@@ -182,18 +182,18 @@ async function main() {
                 for (const svc of groupData.services) {
                     const catId = catMap[svc.cat];
                     const existing = await sequelize.query(
-                        "SELECT id FROM Services WHERE title=? AND category_id=? LIMIT 1",
+                        "SELECT id FROM services WHERE title=? AND category_id=? LIMIT 1",
                         { replacements: [svc.title, catId], type: Sequelize.QueryTypes.SELECT, transaction: t }
                     );
                     if (existing.length > 0) {
                         await sequelize.query(
-                            "UPDATE Services SET price=?, cover_image=?, updatedAt=NOW() WHERE id=?",
+                            "UPDATE services SET price=?, cover_image=?, updatedAt=NOW() WHERE id=?",
                             { replacements: [svc.price, svc.img, existing[0].id], transaction: t }
                         );
                         console.log("Updated service: " + svc.title);
                     } else {
                         await sequelize.query(
-                            "INSERT INTO Services (category_id, title, description, price, cover_image, sales_count, createdAt, updatedAt) VALUES (?,?,?,?,?,0,NOW(),NOW())",
+                            "INSERT INTO services (category_id, title, description, price, cover_image, sales_count, createdAt, updatedAt) VALUES (?,?,?,?,?,0,NOW(),NOW())",
                             { replacements: [catId, svc.title, svc.title, svc.price, svc.img], transaction: t }
                         );
                         console.log("Inserted service: " + svc.title);

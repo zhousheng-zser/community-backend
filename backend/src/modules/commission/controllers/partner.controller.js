@@ -5,9 +5,24 @@
 const {
   PartnerRole,
   PartnerRelation,
+  PartnerApplication,
   User
 } = require('../../../models');
 const commissionService = require('../services/commission.service');
+
+let partnerApplicationTableReady = false;
+
+async function ensurePartnerApplicationTable() {
+  if (partnerApplicationTableReady) return;
+  if (PartnerApplication && PartnerApplication.sync) {
+    await PartnerApplication.sync();
+  }
+  partnerApplicationTableReady = true;
+}
+
+function hasActivePartnerRole(roles) {
+  return (roles || []).some((r) => r.role === 'promoter' && r.status === 'active');
+}
 
 // GET /partner/me - Get current user's partner role info
 exports.getMe = async (req, res) => {
@@ -80,32 +95,97 @@ exports.getMyDownlines = async (req, res) => {
   }
 };
 
-// POST /partner/apply - Apply for a partner role
+// GET /partner/application/me — 申请状态（成为合伙人页）
+exports.getApplicationMe = async (req, res) => {
+  try {
+    await ensurePartnerApplicationTable();
+    const userId = req.user.id;
+    const roles = await PartnerRole.findAll({ where: { user_id: userId } });
+    const isPartner = hasActivePartnerRole(roles);
+
+    let application = null;
+    if (PartnerApplication) {
+      application = await PartnerApplication.findOne({
+        where: { user_id: userId },
+        order: [['created_at', 'DESC']]
+      });
+    }
+
+    res.json({
+      code: 0,
+      msg: 'ok',
+      data: {
+        is_partner: isPartner,
+        application: application ? application.toJSON() : null
+      }
+    });
+  } catch (error) {
+    console.error('获取合伙人申请状态失败:', error);
+    res.status(500).json({ code: 1, msg: '获取申请状态失败' });
+  }
+};
+
+// POST /partner/apply — 填写资料申请成为合伙人（默认推广者角色）
 exports.apply = async (req, res) => {
   try {
+    await ensurePartnerApplicationTable();
     const userId = req.user.id;
-    const { role } = req.body;
+    const body = req.body || {};
+    const role = body.role || 'promoter';
+    const realName = String(body.real_name || body.realName || '').trim();
+    const phone = String(body.phone || '').trim();
+    const city = String(body.city || '').trim();
+    const remark = String(body.remark || '').trim();
 
-    if (!role || !['promoter', 'district_partner', 'market_partner'].includes(role)) {
+    if (!['promoter', 'district_partner', 'market_partner'].includes(role)) {
       return res.status(400).json({ code: 1, msg: '无效的角色类型' });
     }
+    if (!realName) return res.status(400).json({ code: 1, msg: '请填写真实姓名' });
+    if (!/^1\d{10}$/.test(phone)) return res.status(400).json({ code: 1, msg: '请输入正确手机号' });
+    if (!city) return res.status(400).json({ code: 1, msg: '请填写所在城市' });
 
-    // Check if already has this role
-    const existing = await PartnerRole.findOne({
-      where: { user_id: userId, role }
+    const existingRole = await PartnerRole.findOne({
+      where: { user_id: userId, role: 'promoter', status: 'active' }
     });
-
-    if (existing) {
-      return res.status(400).json({ code: 1, msg: '已拥有该角色' });
+    if (existingRole) {
+      return res.status(400).json({ code: 1, msg: '您已是合伙人' });
     }
 
-    // For promoter role, auto-approve
+    const pendingApp = PartnerApplication && await PartnerApplication.findOne({
+      where: { user_id: userId, status: 'pending' }
+    });
+    if (pendingApp) {
+      return res.status(400).json({ code: 1, msg: '申请审核中，请耐心等待' });
+    }
+
+    let application = null;
+    if (PartnerApplication) {
+      application = await PartnerApplication.create({
+        user_id: userId,
+        real_name: realName,
+        phone,
+        city,
+        remark,
+        role,
+        status: 'pending'
+      });
+    }
+
     if (role === 'promoter') {
       const partnerRole = await commissionService.assignPromoterRole(userId);
-      return res.json({ code: 0, msg: '已成为推广者', data: partnerRole.toJSON() });
+      if (application) {
+        await application.update({ status: 'approved' });
+      }
+      return res.json({
+        code: 0,
+        msg: '已成为合伙人',
+        data: {
+          role: partnerRole.toJSON(),
+          application: application ? application.toJSON() : null
+        }
+      });
     }
 
-    // For district/market partner, create pending application
     const partnerRole = await PartnerRole.create({
       user_id: userId,
       role,
@@ -113,7 +193,7 @@ exports.apply = async (req, res) => {
       created_at: new Date()
     });
 
-    res.json({ code: 0, msg: '申请已提交，等待审核', data: partnerRole.toJSON() });
+    res.json({ code: 0, msg: '申请已提交，等待审核', data: { role: partnerRole.toJSON(), application } });
   } catch (error) {
     console.error('合伙人申请失败:', error);
     res.status(500).json({ code: 1, msg: '申请失败' });

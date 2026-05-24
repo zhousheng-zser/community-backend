@@ -1,47 +1,46 @@
 'use strict';
 
 module.exports = (sequelize, DataTypes) => {
-  const WorkerService = sequelize.define('WorkerPersonalService', {
+  const WorkerService = sequelize.define('WorkerService', {
     id: {
       type: DataTypes.BIGINT,
       allowNull: false,
       autoIncrement: true,
       primaryKey: true
     },
-    user_id: {
+    worker_user_id: {
       type: DataTypes.BIGINT,
       allowNull: false,
       comment: '所属技工用户ID'
     },
-    name: {
-      type: DataTypes.STRING(200),
+    service_id: {
+      type: DataTypes.INTEGER,
       allowNull: false,
-      defaultValue: '',
-      comment: '服务名称'
+      comment: '关联平台服务 services.id'
     },
-    price: {
-      type: DataTypes.DECIMAL(10, 2),
-      allowNull: true,
-      comment: '服务价格'
-    },
-    desc: {
-      type: DataTypes.TEXT,
-      allowNull: true,
-      comment: '服务描述'
-    },
-    status: {
-      type: DataTypes.STRING(20),
+    enabled: {
+      type: DataTypes.TINYINT,
       allowNull: false,
-      defaultValue: 'active',
-      comment: 'active/disabled'
+      defaultValue: 1
+    },
+    sort_order: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0
     }
   }, {
-    tableName: 'worker_personal_services',
+    tableName: 'worker_services',
     underscored: true,
     timestamps: true,
     createdAt: 'created_at',
     updatedAt: 'updated_at'
   });
+
+  WorkerService.associate = (models) => {
+    if (models.Service) {
+      WorkerService.belongsTo(models.Service, { foreignKey: 'service_id', as: 'service' });
+    }
+  };
 
   return WorkerService;
 };

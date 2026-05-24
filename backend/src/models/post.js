@@ -16,15 +16,20 @@ module.exports = (sequelize, DataTypes) => {
     }
   }
   Post.init({
-    user_id: DataTypes.INTEGER,
+    user_id: DataTypes.BIGINT,
     content: DataTypes.TEXT,
     images: DataTypes.JSON,
     location: DataTypes.STRING,
-    category: DataTypes.STRING // "热门话题" | "热门活动" | "邻里互动"
+    category: DataTypes.STRING,
+    community_id: DataTypes.BIGINT
   }, {
     sequelize,
     modelName: 'Post',
-    tableName: 'Posts',
+    tableName: 'posts',
+    underscored: false,
+    timestamps: true,
+    createdAt: 'createdAt',
+    updatedAt: 'updatedAt'
   });
   return Post;
 };

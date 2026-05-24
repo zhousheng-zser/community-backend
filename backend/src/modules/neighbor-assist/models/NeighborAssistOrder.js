@@ -7,11 +7,11 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false
     },
     user_id: {
-      type: DataTypes.INTEGER,
+      type: DataTypes.BIGINT.UNSIGNED,
       allowNull: false
     },
     community_id: {
-      type: DataTypes.INTEGER,
+      type: DataTypes.INTEGER.UNSIGNED,
       allowNull: true
     },
     origin_address_snapshot: {
@@ -44,8 +44,16 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false,
       defaultValue: 'unpaid'
     },
+    content: {
+      type: DataTypes.TEXT,
+      allowNull: true
+    },
+    contact_phone: {
+      type: DataTypes.STRING(30),
+      allowNull: true
+    },
     assigned_worker_id: {
-      type: DataTypes.INTEGER,
+      type: DataTypes.BIGINT.UNSIGNED,
       allowNull: true
     },
     dispatch_at: {
@@ -53,12 +61,33 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: true
     },
     dispatch_by: {
-      type: DataTypes.INTEGER,
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true
+    },
+    check_in_at: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    check_in_lat: {
+      type: DataTypes.DECIMAL(10, 6),
+      allowNull: true
+    },
+    check_in_lng: {
+      type: DataTypes.DECIMAL(10, 6),
+      allowNull: true
+    },
+    completion_proof_images: {
+      type: DataTypes.JSON,
       allowNull: true
     },
     completed_at: {
       type: DataTypes.DATE,
       allowNull: true
+    },
+    points_earned: {
+      type: DataTypes.INTEGER.UNSIGNED,
+      allowNull: false,
+      defaultValue: 0
     }
   }, {
     tableName: 'neighbor_assist_orders',

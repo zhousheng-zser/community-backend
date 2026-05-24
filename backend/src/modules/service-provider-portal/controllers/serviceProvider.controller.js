@@ -7,8 +7,26 @@ const ok = (res, data, msg = 'ok') => res.json({ code: 0, msg, data });
 const fail = (res, msg, statusCode = 400) => res.status(statusCode).json({ code: 1, msg });
 let spTablesReady = false;
 
+async function ensureSpShopFrontColumn() {
+  if (!ServiceProviderProfile || !ServiceProviderProfile.sequelize) return;
+  const qi = ServiceProviderProfile.sequelize.getQueryInterface();
+  try {
+    const desc = await qi.describeTable('service_provider_profiles');
+    if (desc && !desc.shop_front_url) {
+      await qi.addColumn('service_provider_profiles', 'shop_front_url', {
+        type: ServiceProviderProfile.sequelize.Sequelize.STRING(500),
+        allowNull: true,
+        comment: '门店封面/门头照'
+      });
+    }
+  } catch (e) {
+    console.warn('[sp] ensure shop_front_url column:', e.message || e);
+  }
+}
+
 async function ensureSpTables() {
   if (spTablesReady) return;
+  await ensureSpShopFrontColumn();
   await Promise.all([
     ServiceProviderProfile && ServiceProviderProfile.sync ? ServiceProviderProfile.sync() : Promise.resolve(),
     ServiceItem && ServiceItem.sync ? ServiceItem.sync() : Promise.resolve(),
@@ -17,8 +35,10 @@ async function ensureSpTables() {
   spTablesReady = true;
 }
 
+const { resolveUserIdFromReq } = require('../../../utils/resolveUserId');
+
 function getUserId(req) {
-  return req.user && req.user.id ? Number(req.user.id) : 0;
+  return resolveUserIdFromReq(req);
 }
 
 async function getProfileByUser(userId) {
@@ -46,6 +66,7 @@ function normalizeProfile(row) {
     description: row.description,
     category: row.category,
     logo: row.logo,
+    shop_front_url: row.shop_front_url || row.logo || '',
     status: row.status,
     reject_reason: row.reject_reason,
     created_at: row.created_at,
@@ -166,8 +187,8 @@ exports.updateProfile = async (req, res) => {
     const profile = await getProfileByUser(userId);
     if (!profile) return fail(res, '暂无服务商信息', 404);
     const body = req.body || {};
-    const allowed = ['shop_name', 'logo', 'contact_name', 'contact_phone', 'address',
-      'latitude', 'longitude', 'business_hours', 'description', 'category'];
+    const allowed = ['shop_name', 'logo', 'shop_front_url', 'contact_name', 'contact_phone',
+      'address', 'latitude', 'longitude', 'business_hours', 'description', 'category'];
     const updateData = {};
     allowed.forEach((k) => {
       if (body[k] !== undefined) updateData[k] = body[k];
@@ -886,14 +907,46 @@ exports.getBalance = async (req, res) => {
     const profile = await getProfileByUser(userId);
     if (!profile) return fail(res, '暂无服务商信息', 404);
 
-    const totalIncome = await ServiceOrder.sum('pay_amount', {
-      where: { provider_id: profile.id, status: 'completed' }
-    }) || 0;
+    const { Op, literal } = require('sequelize');
+    const whereBase = {
+      status: 'completed',
+      [Op.or]: [
+        { provider_id: profile.id },
+        { provider_user_id: String(userId) }
+      ]
+    };
+
+    // Use COALESCE to handle orders where only amount is set
+    const db = require('../../../models');
+    const [[{ total }]] = await db.sequelize.query(
+      `SELECT COALESCE(SUM(COALESCE(pay_amount, amount)), 0) AS total
+       FROM service_orders
+       WHERE status = 'completed'
+         AND (provider_id = :pid OR provider_user_id = :uid)`,
+      { replacements: { pid: profile.id, uid: String(userId) }, type: db.sequelize.QueryTypes.SELECT, raw: true }
+    ).catch(() => [[{ total: 0 }]]);
+
+    const totalIncome = Number(total) || 0;
+
+    // Also check PartnerCommissionBalance for 'service_provider' role (credited by confirmComplete)
+    let commBalance = 0;
+    try {
+      const { PartnerCommissionBalance } = require('../../../models');
+      if (PartnerCommissionBalance) {
+        const cb = await PartnerCommissionBalance.findOne({
+          where: { user_id: String(userId), role: 'service_provider' }
+        });
+        if (cb) commBalance = Number(cb.available_amount || 0);
+      }
+    } catch (_) {}
+
+    const withdrawable = commBalance > 0 ? commBalance : totalIncome;
 
     ok(res, {
-      balance: Number(totalIncome).toFixed(2),
-      total_income: Number(totalIncome).toFixed(2),
-      withdrawable: Number(totalIncome).toFixed(2)
+      balance: withdrawable.toFixed(2),
+      total_income: totalIncome.toFixed(2),
+      withdrawable: withdrawable.toFixed(2),
+      provider_balance: withdrawable.toFixed(2)
     });
   } catch (err) {
     console.error('[sp/balance]', err);

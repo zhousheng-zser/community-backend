@@ -2,8 +2,13 @@ const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../../middlewares/authMiddleware');
 const ctrl = require('./controllers/serviceProvider.controller');
+const applicationController = require('../../controllers/applicationController');
 
 router.use(authMiddleware);
+
+// 入驻申请（小程序 C 端；须登录）
+router.post('/apply', applicationController.serviceProviderApply);
+router.get('/application/me', applicationController.getServiceProviderApplicationMe);
 
 // 8.1 个人信息
 router.get('/me', ctrl.getMe);

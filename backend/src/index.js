@@ -55,8 +55,6 @@ app.use((req, res, next) => {
 // 静态文件目录映射到项目内 data/uploads/images 目录（兼容 Linux 部署）
 const path = require('path');
 app.use('/uploads', express.static(path.join(__dirname, '..', 'data', 'uploads', 'images')));
-// 小程序分类 Tab 图标（seed 中 /img/index/menuicon*.png）；运营中台经 Vite 代理 /img 访问
-app.use('/img/index', express.static(path.join(__dirname, '..', 'static', 'img', 'index')));
 app.get('/img/placeholders/:name', (req, res) => {
     // 测试环境兜底占位图，避免前端引用历史占位路径时报 500
     const onePxPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Zx1cAAAAASUVORK5CYII=';
@@ -84,10 +82,12 @@ app.use('/api/v1/posts', postRoutes);
 app.use('/api/v1/core', coreDataRoutes);
 app.use('/api/v1/geo', require('./routes/geoRoutes'));
 app.use('/api/v1/service-orders', require('./routes/serviceOrderRoutes'));
+app.use('/api/v1/service-cart', require('./routes/serviceCartRoutes'));
 app.use('/api/v1/neighbor-assist', require('./routes/neighborAssistRoutes'));
 app.use('/api/v1/user', userRoutes);
 app.use('/api/v1/messages', require('./routes/messageRoutes'));
 app.use('/api/v1/worker', require('./routes/workerRoutes'));
+app.use('/api/v1/steward', require('./modules/steward/routes'));
 
 const workerPortalLoginController = require('./controllers/workerPortalLoginController');
 const merchantPortalController = require('./controllers/merchantPortalController');
@@ -102,6 +102,8 @@ app.use('/api/v1/service-provider-portal/workers', require('./routes/serviceProv
 app.use('/api/v1/service-provider-portal/finance', require('./routes/serviceProviderFinanceRoutes'));
 app.use('/api/v1/market/merchant', merchantPortalRoutes);
 app.use('/api/v1/market/shop', merchantPortalRoutes);
+// 商家订单/配送（modules/merchant）；254 线上由 merchantPortalRoutes 一并提供
+app.use('/api/v1/market/merchant', require('./modules/merchant/routes'));
 app.use('/api/v1/market/merchant/customers', require('./routes/merchantCustomerRoutes'));
 app.use('/api/v1/market/merchant/marketing', require('./routes/merchantMarketingRoutes'));
 app.use('/api/v1/market/merchant/refunds', require('./routes/merchantRefundRoutes'));
@@ -118,6 +120,9 @@ app.use('/api/v1/local-goods-home', require('./routes/localGoodsHomeRoutes'));
 // New modules: chat, coupons, benefit-coin, promoter, mini-programs
 app.use('/api/v1/chat', require('./routes/chatRoutes'));
 app.use('/api/v1/coupons', require('./routes/couponRoutes'));
+const couponCtrl = require('./modules/coupon/controllers/coupon.controller');
+const authMiddleware = require('./middlewares/authMiddleware');
+app.get('/api/v1/wx/user/coupon/:id', authMiddleware, couponCtrl.getMyCouponsLegacy);
 app.use('/api/v1/benefit-coin', require('./routes/benefitCoinRoutes'));
 app.use('/api/v1/promoter', require('./routes/promoterRoutes'));
 app.use('/api/v1/commission', require('./modules/commission/commission.routes'));
@@ -132,10 +137,10 @@ require('./mountBenefitAlliance')(app);
 // ===================
 const userController = require('./controllers/userController');
 app.get('/api/v1/acount/info', userController.getAccountInfo);
-app.get('/api/v1/wx/user/coupon/:id', userController.getUserCoupons);
+// wx/user/coupon 已在上方注册 getMyCouponsLegacy（带鉴权），勿重复注册空 stub
 
-// 本地集市商家入驻图片上传接口（统一 JSON 返回）
-const { uploadMarketImage, getImageMeta } = require('./utils/marketUpload');
+// 图片上传：入驻单图 ≤200KB；通用 /upload 可达 10MB
+const { uploadMarketImage, uploadApplicationImage, getImageMeta } = require('./utils/marketUpload');
 function handleUpload(req, res) {
     const { width, height } = getImageMeta(req.file.path);
     return res.json({
@@ -146,13 +151,14 @@ function handleUpload(req, res) {
             size: req.file.size,
             mime_type: req.file.mimetype,
             width,
-            height
+            height,
+            max_bytes: Number(res.getHeader('X-Upload-Max-Bytes')) || null
         }
     });
 }
-// 新路径
+app.post('/api/v1/upload/application', uploadApplicationImage, handleUpload);
+app.post('/upload/application', uploadApplicationImage, handleUpload);
 app.post('/api/v1/upload', uploadMarketImage, handleUpload);
-// 兼容小程序历史路径，避免前端命中非 JSON 响应
 app.post('/upload', uploadMarketImage, handleUpload);
 
 

@@ -2,9 +2,16 @@ const {
     User, UserFollow, UserAddress,
     MarketApplication, MarketShop,
     WorkerApplication, WorkerProfile,
-    ServiceProviderApplication, ServiceProviderProfile
+    ServiceProviderApplication, ServiceProviderProfile,
+    CommunityStewardApplication
 } = require('../models');
-const { resolveUserId } = require('../utils/resolveUserId');
+const { resolveUserId, resolveUserIdFromReq } = require('../utils/resolveUserId');
+const commissionService = require('../modules/commission/services/commission.service');
+
+function pickRoleBalance(roles, roleName) {
+    const r = (roles || []).find((x) => x.role === roleName);
+    return r ? Number(r.available_amount || 0) : 0;
+}
 
 exports.getProfile = async (req, res) => {
     try {
@@ -64,6 +71,9 @@ exports.getProfile = async (req, res) => {
         const serviceProviderStatus = latestServiceProviderApplication
             ? latestServiceProviderApplication.status
             : null;
+        if (serviceProviderStatus === 'approved' && !roles.includes('service_provider')) {
+            roles.push('service_provider');
+        }
 
         let workerProfileId = null;
         if (workerStatus === 'approved') {
@@ -85,9 +95,40 @@ exports.getProfile = async (req, res) => {
             serviceProviderProfileId = sp ? sp.id : null;
         }
 
+        let stewardStatus = null;
+        if (CommunityStewardApplication) {
+            try {
+                const stewardApp = await CommunityStewardApplication.findOne({
+                    where: { user_id: userId },
+                    attributes: ['status']
+                });
+                stewardStatus = stewardApp ? stewardApp.status : null;
+            } catch (e) { /* ignore */ }
+        }
+        if (stewardStatus === 'approved' && !roles.includes('steward')) {
+            roles.push('steward');
+        }
+
+        const balanceSummary = await commissionService.getUserBalance(userId);
+        const merchantAvailable = pickRoleBalance(balanceSummary.roles, 'merchant');
+        const workerAvailable = pickRoleBalance(balanceSummary.roles, 'neighbor_assist')
+            + pickRoleBalance(balanceSummary.roles, 'worker');
+        const providerAvailable = pickRoleBalance(balanceSummary.roles, 'service_provider');
+
         res.json({
             ...profile,
+            balance: Number(balanceSummary.available_amount.toFixed(2)),
+            market_merchant_balance: Number(merchantAvailable.toFixed(2)),
+            worker_balance: Number(workerAvailable.toFixed(2)),
+            provider_balance: Number(providerAvailable.toFixed(2)),
+            commission_available: balanceSummary.available_amount,
+            commission_pending: balanceSummary.pending_amount,
+            commission_withdrawn: balanceSummary.withdrawn_amount,
+            commission_total: balanceSummary.total_earned,
+            commission_roles: balanceSummary.roles,
             role: roles.join(','),
+            roles,
+            communityId: profile.community_id != null ? profile.community_id : null,
             merchant_status: merchantStatus,
             shop_status: merchantStatus,
             shop_id: shopId,
@@ -99,7 +140,9 @@ exports.getProfile = async (req, res) => {
             service_provider_application_id: latestServiceProviderApplication
                 ? latestServiceProviderApplication.id
                 : null,
-            service_provider_profile_id: serviceProviderProfileId
+            service_provider_profile_id: serviceProviderProfileId,
+            steward_status: stewardStatus === 'approved' ? 'approved' : (stewardStatus || ''),
+            stewardStatus: stewardStatus === 'approved' ? 'approved' : (stewardStatus || '')
         });
     } catch (error) {
         console.error('Get Profile Error:', error);
@@ -109,8 +152,12 @@ exports.getProfile = async (req, res) => {
 
 exports.updateProfile = async (req, res) => {
     try {
-        const { nickname, phone, address, bank_num, wx_id } = req.body;
-        const user = await User.findByPk(req.user.id);
+        const userId = resolveUserId(req.user && req.user.id);
+        if (!userId) return res.status(401).json({ error: '未登录' });
+
+        const body = req.body || {};
+        const { nickname, phone, address, bank_num, wx_id } = body;
+        const user = await User.findByPk(userId);
 
         if (!user) {
             return res.status(404).json({ error: '用户不存在' });
@@ -122,15 +169,43 @@ exports.updateProfile = async (req, res) => {
         if (bank_num) user.bank_num = bank_num;
         if (wx_id) user.wx_id = wx_id;
 
+        const rawComm = body.community_id != null ? body.community_id : body.communityId;
+        if (rawComm != null && rawComm !== '') {
+            const cid = parseInt(rawComm, 10);
+            if (!Number.isFinite(cid) || cid <= 0) {
+                return res.status(400).json({ code: 1, errno: 400, msg: '无效的小区 ID' });
+            }
+            const db = require('../models');
+            const Community = db.Community;
+            if (Community) {
+                const comm = await Community.findByPk(cid, { attributes: ['id', 'status'] });
+                if (!comm || String(comm.status) !== 'active') {
+                    return res.status(400).json({ code: 1, errno: 400, msg: '小区不存在或已停用' });
+                }
+            }
+            user.community_id = cid;
+        }
+
         if (req.file) {
             const baseUrl = req.protocol + '://' + req.get('host');
             user.avatar_url = baseUrl + '/uploads/' + req.file.filename;
+        } else if (body.avatar_url != null && body.avatar_url !== '') {
+            const av = String(body.avatar_url).trim();
+            user.avatar_url = av;
         }
 
         await user.save();
 
         res.json({
+            code: 0,
+            errno: 0,
+            msg: '个人资料更新成功',
             message: '个人资料更新成功',
+            data: {
+                id: user.id,
+                community_id: user.community_id,
+                communityId: user.community_id
+            },
             user: {
                 id: user.id,
                 nickname: user.nickname,
@@ -140,12 +215,14 @@ exports.updateProfile = async (req, res) => {
                 bank_num: user.bank_num,
                 wx_id: user.wx_id,
                 role: user.role,
-                balance: user.balance
+                balance: user.balance,
+                community_id: user.community_id,
+                communityId: user.community_id
             }
         });
     } catch (error) {
         console.error('Update Profile Error:', error);
-        res.status(500).json({ error: '服务器内部错误' });
+        res.status(500).json({ code: 1, errno: 500, msg: '服务器内部错误', error: '服务器内部错误' });
     }
 };
 
@@ -162,7 +239,7 @@ exports.getUserCoupons = async (req, res) => {
 // 获取我的关注列表 GET /api/v1/user/follows
 exports.getFollows = async (req, res) => {
     try {
-        const userId = req.user.id;
+        const userId = resolveUserIdFromReq(req);
         const list = await UserFollow.findAll({
             where: { user_id: userId },
             include: [{ model: User, as: 'followUser', attributes: ['id', 'nickname', 'avatar_url'] }]
@@ -403,7 +480,10 @@ function generateInviteCode() {
  */
 exports.getInviteCode = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = resolveUserIdFromReq(req);
+    if (!userId) {
+      return res.status(401).json({ code: 401, msg: '未登录', data: null });
+    }
     const user = await User.findByPk(userId, {
       attributes: ['id', 'nickname', 'avatar_url', 'invite_code', 'invited_by']
     });
@@ -456,7 +536,7 @@ exports.getInviteCode = async (req, res) => {
  */
 exports.bindInviter = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = resolveUserIdFromReq(req);
     const { invite_code } = req.body;
     if (!invite_code || typeof invite_code !== 'string') {
       return res.status(400).json({ code: 400, msg: '缺少邀请码', data: null });
@@ -505,7 +585,7 @@ exports.bindInviter = async (req, res) => {
  */
 exports.getInvitees = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = resolveUserIdFromReq(req);
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 50);
     const offset = (page - 1) * limit;

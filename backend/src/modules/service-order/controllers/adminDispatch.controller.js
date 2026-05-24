@@ -65,12 +65,13 @@ exports.assignWorker = async (req, res) => {
     const id = Number(req.params.id);
     if (!id) return fail(res, '无效订单ID');
     const body = req.body || {};
-    const workerUserId = Number(body.worker_user_id || body.worker_id || 0);
-    if (!workerUserId) return fail(res, '缺少 worker_user_id');
+    // 雪花 ID 为大整数，禁止用 Number() 转换（精度丢失）；保持字符串形式传给 Sequelize
+    const rawWorkerId = body.worker_user_id || body.worker_id;
+    const workerUserId = rawWorkerId != null && rawWorkerId !== '' ? String(rawWorkerId).trim() : null;
+    if (!workerUserId || !/^\d+$/.test(workerUserId)) return fail(res, '缺少 worker_user_id');
 
-    let workerAppr = null;
     if (WorkerApplication) {
-      workerAppr = await WorkerApplication.findOne({
+      const workerAppr = await WorkerApplication.findOne({
         where: { user_id: workerUserId, status: 'approved' }
       });
       if (!workerAppr) return fail(res, '该用户不是已认证技工', 400);
@@ -81,15 +82,8 @@ exports.assignWorker = async (req, res) => {
     if (row.status !== 'paid_pending_dispatch') {
       return fail(res, '仅待平台派单状态的订单可指派', 400);
     }
-    const existingWu = row.worker_user_id != null ? Number(row.worker_user_id) : 0;
-    if (existingWu > 0) return fail(res, '订单已指派技工', 400);
-
-    if (row.community_id != null && Number(row.community_id) > 0 && workerAppr) {
-      const workerComm = workerAppr.community_id != null ? Number(workerAppr.community_id) : null;
-      if (workerComm != null && workerComm !== Number(row.community_id)) {
-        return fail(res, '技工所属小区与订单不一致，无法派单', 400);
-      }
-    }
+    const existingWu = row.worker_user_id != null ? String(row.worker_user_id) : '';
+    if (existingWu && existingWu !== '0') return fail(res, '订单已指派技工', 400);
 
     await row.update({
       worker_user_id: workerUserId,

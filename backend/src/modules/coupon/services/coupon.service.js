@@ -1,7 +1,9 @@
+const { Op } = require('sequelize');
 const db = require('../../../models');
-const { CouponTemplate, CouponIssue } = db;
+const { CouponTemplate, CouponIssue, User } = db;
 
-const WELCOME_TEMPLATE_CODE = 'WELCOME_100_10';
+const WELCOME_TEMPLATE_CODE = 'WELCOME_100_20';
+const LEGACY_WELCOME_CODES = ['WELCOME_100_10', 'WELCOME_100_20'];
 
 let tablesReady = false;
 
@@ -14,6 +16,115 @@ async function ensureCouponTables() {
   tablesReady = true;
 }
 
+function generateIssueCode() {
+  return 'CPN' + Date.now() + Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function remainCount(template) {
+  const total = Number(template.total_count) || 0;
+  if (total <= 0) return null;
+  const issued = Number(template.issued_count) || 0;
+  return Math.max(total - issued, 0);
+}
+
+function isReceiveWindowOpen(template, now = new Date()) {
+  if (template.receive_from && now < new Date(template.receive_from)) return false;
+  if (template.receive_to && now > new Date(template.receive_to)) return false;
+  return true;
+}
+
+function isValidPeriod(template, now = new Date()) {
+  if (template.valid_from && now < new Date(template.valid_from)) return false;
+  if (template.valid_to && now > new Date(template.valid_to)) return false;
+  return true;
+}
+
+function matchesApplyScope(template, orderType) {
+  const scope = String(template.apply_scope || 'all').toLowerCase();
+  if (!orderType || scope === 'all') return true;
+  return scope === String(orderType).toLowerCase();
+}
+
+async function countUserUnused(userId, templateId, transaction) {
+  return CouponIssue.count({
+    where: { user_id: userId, template_id: templateId, status: 'unused' },
+    transaction
+  });
+}
+
+async function assertCanIssue(userId, template, transaction) {
+  const now = new Date();
+  if (!template || template.status !== 'active') {
+    const err = new Error('优惠券不存在或已失效');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (!isValidPeriod(template, now)) {
+    const err = new Error('优惠券已过期');
+    err.statusCode = 400;
+    throw err;
+  }
+  const remain = remainCount(template);
+  if (remain != null && remain <= 0) {
+    const err = new Error('优惠券已领完');
+    err.statusCode = 400;
+    throw err;
+  }
+  const limit = Number(template.per_user_limit) || 1;
+  const unused = await countUserUnused(userId, template.id, transaction);
+  if (unused >= limit) {
+    const err = new Error('已达领取上限');
+    err.statusCode = 400;
+    throw err;
+  }
+}
+
+async function incrementIssuedCount(templateId, transaction) {
+  const [affected] = await CouponTemplate.update(
+    { issued_count: db.sequelize.literal('issued_count + 1') },
+    {
+      where: {
+        id: templateId,
+        [Op.or]: [
+          { total_count: 0 },
+          db.sequelize.where(
+            db.sequelize.col('issued_count'),
+            Op.lt,
+            db.sequelize.col('total_count')
+          )
+        ]
+      },
+      transaction
+    }
+  );
+  if (!affected) {
+    const err = new Error('优惠券库存不足');
+    err.statusCode = 400;
+    throw err;
+  }
+}
+
+async function issueToUser(userId, templateId, options = {}) {
+  const { source = 'claim', transaction: outerTx } = options;
+  const run = async (transaction) => {
+    await ensureCouponTables();
+    const template = await CouponTemplate.findByPk(templateId, { transaction, lock: transaction.LOCK.UPDATE });
+    await assertCanIssue(userId, template, transaction);
+    const issue = await CouponIssue.create({
+      template_id: templateId,
+      user_id: userId,
+      code: generateIssueCode(),
+      status: 'unused',
+      issued_at: new Date(),
+      issue_source: source
+    }, { transaction });
+    await incrementIssuedCount(templateId, transaction);
+    return issue;
+  };
+  if (outerTx) return run(outerTx);
+  return db.sequelize.transaction(run);
+}
+
 async function getOrCreateWelcomeTemplate(transaction) {
   const opts = transaction ? { transaction } : {};
   let tpl = await CouponTemplate.findOne({ where: { code: WELCOME_TEMPLATE_CODE }, ...opts });
@@ -22,39 +133,63 @@ async function getOrCreateWelcomeTemplate(transaction) {
     const nextYear = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
     tpl = await CouponTemplate.create({
       code: WELCOME_TEMPLATE_CODE,
-      name: '满100减10新人券',
+      name: '满100减20新人券',
       type: 'amount',
-      discount_amount: 10,
+      discount_amount: 20,
       threshold_amount: 100,
       total_count: 0,
       issued_count: 0,
       valid_from: now,
       valid_to: nextYear,
-      status: 'active'
+      status: 'active',
+      issue_mode: 'auto_new_user',
+      is_new_user: 1,
+      apply_scope: 'all',
+      per_user_limit: 1
     }, opts);
   }
   return tpl;
 }
 
-/** 新用户首次进入时发放默认满100减10券（每用户一张） */
 async function ensureWelcomeCoupon(userId) {
   if (!userId || !CouponTemplate || !CouponIssue) return null;
   await ensureCouponTables();
-  const tpl = await getOrCreateWelcomeTemplate();
-  const existing = await CouponIssue.findOne({
-    where: { user_id: userId, template_id: tpl.id }
+  const now = new Date();
+  let templates = await CouponTemplate.findAll({
+    where: {
+      status: 'active',
+      issue_mode: 'auto_new_user',
+      is_new_user: 1
+    }
   });
-  if (existing) return existing;
-  const code = 'CPN' + Date.now() + Math.random().toString(36).substring(2, 8).toUpperCase();
-  const issue = await CouponIssue.create({
-    template_id: tpl.id,
-    user_id: userId,
-    code,
-    status: 'unused',
-    issued_at: new Date()
-  });
-  await tpl.increment('issued_count');
-  return issue;
+  if (!templates.length) {
+    templates = [await getOrCreateWelcomeTemplate()];
+  }
+  templates = templates.filter((t) => isValidPeriod(t, now));
+  if (!templates.length) return null;
+
+  const legacyTpls = await CouponTemplate.findAll({ where: { code: LEGACY_WELCOME_CODES } });
+  const legacyIds = legacyTpls.map((t) => t.id);
+  if (legacyIds.length) {
+    const existingAny = await CouponIssue.findOne({
+      where: { user_id: userId, template_id: { [Op.in]: legacyIds } }
+    });
+    if (existingAny) return existingAny;
+  }
+
+  let lastIssue = null;
+  for (const tpl of templates) {
+    const unused = await countUserUnused(userId, tpl.id);
+    const limit = Number(tpl.per_user_limit) || 1;
+    if (unused >= limit) continue;
+    try {
+      lastIssue = await issueToUser(userId, tpl.id, { source: 'auto' });
+    } catch (e) {
+      if (e.statusCode === 400 && /上限|领完/.test(e.message)) continue;
+      throw e;
+    }
+  }
+  return lastIssue;
 }
 
 function mapIssueRow(i) {
@@ -68,6 +203,7 @@ function mapIssueRow(i) {
     coupon_money: tpl.discount_amount != null ? Number(tpl.discount_amount) : 0,
     discount_amount: tpl.discount_amount != null ? Number(tpl.discount_amount) : 0,
     threshold_amount: tpl.threshold_amount != null ? Number(tpl.threshold_amount) : 0,
+    apply_scope: tpl.apply_scope || 'all',
     status: i.status,
     issued_at: i.issued_at,
     end_time: validTo,
@@ -76,7 +212,39 @@ function mapIssueRow(i) {
   };
 }
 
-async function validateCouponForOrder(userId, couponIssueId, orderAmount, transaction) {
+function mapTemplateRow(t, extra = {}) {
+  const remain = remainCount(t);
+  return {
+    id: t.id,
+    code: t.code,
+    name: t.name,
+    coupon_name: t.name,
+    type: t.type,
+    coupon_money: t.discount_amount,
+    discount_amount: t.discount_amount,
+    threshold_amount: t.threshold_amount,
+    total_count: t.total_count,
+    issued_count: t.issued_count,
+    remain_count: remain,
+    valid_from: t.valid_from,
+    valid_to: t.valid_to,
+    end_time: t.valid_to,
+    endTime: t.valid_to,
+    status: t.status,
+    issue_mode: t.issue_mode || 'claim',
+    per_user_limit: t.per_user_limit != null ? Number(t.per_user_limit) : 1,
+    receive_from: t.receive_from,
+    receive_to: t.receive_to,
+    apply_scope: t.apply_scope || 'all',
+    show_on_home: !!t.show_on_home,
+    home_sort: t.home_sort != null ? Number(t.home_sort) : 0,
+    description: t.description || '',
+    is_new_user: !!t.is_new_user,
+    ...extra
+  };
+}
+
+async function validateCouponForOrder(userId, couponIssueId, orderAmount, transaction, orderType) {
   if (!couponIssueId) {
     return { discount: 0, issue: null, template: null, goodsAmount: orderAmount, payableAmount: orderAmount };
   }
@@ -99,13 +267,13 @@ async function validateCouponForOrder(userId, couponIssueId, orderAmount, transa
     throw err;
   }
   const now = new Date();
-  if (tpl.valid_from && now < new Date(tpl.valid_from)) {
-    const err = new Error('优惠券未到使用时间');
+  if (!isValidPeriod(tpl, now)) {
+    const err = new Error(tpl.valid_to && now > new Date(tpl.valid_to) ? '优惠券已过期' : '优惠券未到使用时间');
     err.statusCode = 400;
     throw err;
   }
-  if (tpl.valid_to && now > new Date(tpl.valid_to)) {
-    const err = new Error('优惠券已过期');
+  if (orderType && !matchesApplyScope(tpl, orderType)) {
+    const err = new Error('该优惠券不适用于当前订单类型');
     err.statusCode = 400;
     throw err;
   }
@@ -144,11 +312,66 @@ async function releaseCouponByOrder(orderType, orderRef, transaction) {
   );
 }
 
+async function batchIssueToUsers(templateId, userIds, source = 'admin_batch') {
+  const stats = { success: 0, skip: 0, fail: 0, errors: [] };
+  const uniqueIds = [...new Set(userIds.map((id) => String(id)).filter(Boolean))];
+  for (const uid of uniqueIds) {
+    try {
+      await issueToUser(uid, templateId, { source });
+      stats.success += 1;
+    } catch (e) {
+      if (e.statusCode === 400 && /上限|已领完|领完/.test(e.message)) {
+        stats.skip += 1;
+      } else {
+        stats.fail += 1;
+        if (stats.errors.length < 20) stats.errors.push({ user_id: uid, msg: e.message });
+      }
+    }
+  }
+  return stats;
+}
+
+async function batchIssueAllUsers(templateId) {
+  if (!User) {
+    const err = new Error('User 模型不可用');
+    err.statusCode = 500;
+    throw err;
+  }
+  const pageSize = 500;
+  let offset = 0;
+  const stats = { success: 0, skip: 0, fail: 0, errors: [] };
+  for (;;) {
+    const rows = await User.findAll({
+      attributes: ['id'],
+      limit: pageSize,
+      offset,
+      order: [['id', 'ASC']]
+    });
+    if (!rows.length) break;
+    const part = await batchIssueToUsers(templateId, rows.map((r) => r.id), 'admin_batch');
+    stats.success += part.success;
+    stats.skip += part.skip;
+    stats.fail += part.fail;
+    stats.errors.push(...part.errors);
+    offset += pageSize;
+    if (rows.length < pageSize) break;
+  }
+  return stats;
+}
+
 module.exports = {
   WELCOME_TEMPLATE_CODE,
   ensureCouponTables,
   ensureWelcomeCoupon,
+  issueToUser,
+  batchIssueToUsers,
+  batchIssueAllUsers,
   mapIssueRow,
+  mapTemplateRow,
+  remainCount,
+  isReceiveWindowOpen,
+  isValidPeriod,
+  matchesApplyScope,
   validateCouponForOrder,
   markCouponUsed,
   releaseCouponByOrder

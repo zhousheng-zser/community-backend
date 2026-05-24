@@ -15,6 +15,8 @@ const userRoutes = require('../modules/user/routes');
 
 // ── 核心功能 ──────────────────────────────────────────────────────────────
 const coreRoutes = require('../modules/core/routes');
+const coreDataRoutes = require('./coreDataRoutes');
+const adminServiceHomeRoutes = require('./adminServiceHome.routes');
 
 // ── 首页 ─────────────────────────────────────────────────────────────────
 // const homeRoutes = require('../modules/home/routes');
@@ -74,6 +76,7 @@ const messageRoutes = require('../modules/message/routes');
 // ── 挂载 ─────────────────────────────────────────────────────────────────
 router.use('/auth', authRoutes);
 router.use('/user', userRoutes);
+router.use('/core', coreDataRoutes);
 router.use('/core', coreRoutes);
 // router.use('/home', homeRoutes);
 router.use('/market', marketRoutes);
@@ -81,6 +84,7 @@ router.use('/market', marketRoutes);
 router.use('/benefit-coin', benefitCardRoutes);
 router.use('/benefit-alliance', benefitAllianceRoutes);
 router.use('/admin', benefitAllianceAdminRoutes);
+router.use('/admin', adminServiceHomeRoutes);
 const adminDispatchRoutes = require('../modules/service-order/adminDispatch.routes');
 // 九州派单（到家）：线上 adminRoutes 亦挂载 assign；本地用 adminDispatch 子路由
 router.use('/admin', adminDispatchRoutes);
@@ -102,6 +106,7 @@ router.use('/service-provider-portal', serviceProviderRoutes); // 兼容旧路�
 router.use('/community', communityRoutes);
 router.use('/service-order', serviceOrderRoutes);
 router.use('/service-orders', serviceOrderRoutes); // 兼容前端复数路径
+router.use('/service-cart', require('./serviceCartRoutes'));
 router.use('/message', messageRoutes);
 router.use('/messages', messageRoutes); // 兼容前端复数路径
 

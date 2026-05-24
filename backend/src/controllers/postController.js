@@ -1,4 +1,43 @@
 const { Post, User, Comment, Like } = require('../models');
+const { resolveUserId } = require('../utils/resolveUserId');
+
+function postsResponse(posts, page, limit) {
+    const rows = posts.rows;
+    return {
+        message: '获取成功',
+        total: posts.count,
+        page,
+        limit,
+        list: rows,
+        data: rows
+    };
+}
+
+/** 当前浏览者所属小区：query 优先，否则读登录用户 users.community_id */
+async function resolveViewerCommunityId(req) {
+    if (req.query.community_id != null && req.query.community_id !== '') {
+        const cid = parseInt(req.query.community_id, 10);
+        if (Number.isFinite(cid) && cid > 0) return cid;
+    }
+    const userId = resolveUserId(req.user && req.user.id);
+    if (!userId) return null;
+    const user = await User.findByPk(userId, { attributes: ['community_id'] });
+    if (!user || user.community_id == null) return null;
+    const cid = parseInt(user.community_id, 10);
+    return Number.isFinite(cid) && cid > 0 ? cid : null;
+}
+
+async function assertPostVisibleToViewer(post, viewerCommunityId) {
+    if (!post) return { ok: false, status: 404, error: '帖子不存在' };
+    if (viewerCommunityId == null) {
+        return { ok: false, status: 403, error: '请先绑定所属小区' };
+    }
+    const pc = post.community_id != null ? Number(post.community_id) : null;
+    if (pc != null && pc !== Number(viewerCommunityId)) {
+        return { ok: false, status: 403, error: '无权查看其他小区的帖子' };
+    }
+    return { ok: true };
+}
 
 // 1. 获取社区帖子列表 (朋友图形式：按时间倒序排，带上用户信息、评论、点赞)
 exports.getPosts = async (req, res) => {
@@ -7,7 +46,17 @@ exports.getPosts = async (req, res) => {
         const limit = parseInt(req.query.limit) || 10;
         const offset = (page - 1) * limit;
 
-        const whereClause = {};
+        const hasAuthHeader = !!(req.headers.authorization && req.headers.authorization.startsWith('Bearer '));
+        if (hasAuthHeader && !req.user) {
+            return res.status(401).json({ error: '登录已失效，请重新登录', errno: 401, errmsg: '登录已失效，请重新登录' });
+        }
+
+        const communityId = await resolveViewerCommunityId(req);
+        if (!communityId) {
+            return res.json(postsResponse({ count: 0, rows: [] }, page, limit));
+        }
+
+        const whereClause = { community_id: communityId };
         if (req.query.category) {
             whereClause.category = req.query.category;
         }
@@ -39,29 +88,83 @@ exports.getPosts = async (req, res) => {
             ]
         });
 
-        res.json({
-            message: '获取成功',
-            total: posts.count,
-            page: page,
-            limit: limit,
-            data: posts.rows
-        });
+        res.json(postsResponse(posts, page, limit));
     } catch (error) {
         console.error('获取帖子失败:', error);
         res.status(500).json({ error: '获取帖子失败' });
     }
 };
 
+// 1.0 帖子详情
+exports.getPostDetail = async (req, res) => {
+    try {
+        const postId = parseInt(req.params.postId, 10);
+        if (!Number.isFinite(postId) || postId <= 0) {
+            return res.status(400).json({ error: '无效帖子 id' });
+        }
+
+        const hasAuthHeader = !!(req.headers.authorization && req.headers.authorization.startsWith('Bearer '));
+        if (hasAuthHeader && !req.user) {
+            return res.status(401).json({ error: '登录已失效，请重新登录', errno: 401, errmsg: '登录已失效，请重新登录' });
+        }
+
+        const post = await Post.findByPk(postId, {
+            include: [
+                {
+                    model: User,
+                    as: 'author',
+                    attributes: ['id', 'nickname', 'avatar_url', 'bg_image']
+                },
+                {
+                    model: Comment,
+                    as: 'comments',
+                    include: [
+                        { model: User, as: 'author', attributes: ['id', 'nickname', 'avatar_url'] },
+                        { model: User, as: 'replyToUser', attributes: ['id', 'nickname'] }
+                    ]
+                },
+                {
+                    model: Like,
+                    as: 'likes',
+                    include: [{ model: User, as: 'user', attributes: ['id', 'nickname'] }]
+                }
+            ]
+        });
+
+        let viewerCommunityId = await resolveViewerCommunityId(req);
+        if (!viewerCommunityId && post && post.community_id != null) {
+            const pc = parseInt(post.community_id, 10);
+            if (Number.isFinite(pc) && pc > 0) viewerCommunityId = pc;
+        }
+        if (!viewerCommunityId) {
+            return res.status(403).json({ errno: 403, error: '请先绑定所属小区', errmsg: '请先绑定所属小区' });
+        }
+
+        const vis = await assertPostVisibleToViewer(post, viewerCommunityId);
+        if (!vis.ok) return res.status(vis.status).json({ errno: vis.status, error: vis.error, errmsg: vis.error });
+
+        res.json({ message: '获取成功', data: post });
+    } catch (error) {
+        console.error('获取帖子详情失败:', error);
+        res.status(500).json({ error: '获取帖子详情失败' });
+    }
+};
+
 // 1.1 获取我发布的帖子
 exports.getMyPublishedPosts = async (req, res) => {
     try {
-        const userId = req.user.id;
+        const userId = resolveUserId(req.user && req.user.id);
+        if (!userId) return res.status(401).json({ error: '未登录' });
+        const communityId = await resolveViewerCommunityId(req);
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
         const offset = (page - 1) * limit;
 
+        const where = { user_id: userId };
+        if (communityId) where.community_id = communityId;
+
         const posts = await Post.findAndCountAll({
-            where: { user_id: userId },
+            where,
             offset: offset,
             limit: limit,
             order: [['createdAt', 'DESC']],
@@ -72,7 +175,7 @@ exports.getMyPublishedPosts = async (req, res) => {
             ]
         });
 
-        res.json({ message: '获取成功', total: posts.count, page: page, limit: limit, data: posts.rows });
+        res.json(postsResponse(posts, page, limit));
     } catch (error) {
         console.error('获取我的发布失败:', error);
         res.status(500).json({ error: '获取我的发布失败' });
@@ -82,7 +185,9 @@ exports.getMyPublishedPosts = async (req, res) => {
 // 1.2 获取我点赞过的帖子
 exports.getMyLikedPosts = async (req, res) => {
     try {
-        const userId = req.user.id;
+        const userId = resolveUserId(req.user && req.user.id);
+        if (!userId) return res.status(401).json({ error: '未登录' });
+        const communityId = await resolveViewerCommunityId(req);
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
         const offset = (page - 1) * limit;
@@ -93,9 +198,15 @@ exports.getMyLikedPosts = async (req, res) => {
             attributes: ['post_id']
         });
         const postIds = likes.map(like => like.post_id);
+        if (!postIds.length) {
+            return res.json(postsResponse({ count: 0, rows: [] }, page, limit));
+        }
+
+        const likedWhere = { id: postIds };
+        if (communityId) likedWhere.community_id = communityId;
 
         const posts = await Post.findAndCountAll({
-            where: { id: postIds },
+            where: likedWhere,
             offset: offset,
             limit: limit,
             order: [['createdAt', 'DESC']],
@@ -106,7 +217,7 @@ exports.getMyLikedPosts = async (req, res) => {
             ]
         });
 
-        res.json({ message: '获取成功', total: posts.count, page: page, limit: limit, data: posts.rows });
+        res.json(postsResponse(posts, page, limit));
     } catch (error) {
         console.error('获取我的点赞失败:', error);
         res.status(500).json({ error: '获取我的点赞失败' });
@@ -116,7 +227,9 @@ exports.getMyLikedPosts = async (req, res) => {
 // 1.3 获取我参与的话题/活动 (发过或者评论过的某分类的帖子)
 exports.getMyParticipatedPosts = async (req, res) => {
     try {
-        const userId = req.user.id;
+        const userId = resolveUserId(req.user && req.user.id);
+        if (!userId) return res.status(401).json({ error: '未登录' });
+        const communityId = await resolveViewerCommunityId(req);
         const category = req.query.category; // "热门话题" or "热门活动"
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
@@ -133,14 +246,17 @@ exports.getMyParticipatedPosts = async (req, res) => {
 
         const { Op } = require('sequelize');
 
+        const baseWhere = {
+            category: category,
+            [Op.or]: [
+                { user_id: userId },
+                { id: commentedPostIds }
+            ]
+        };
+        if (communityId) baseWhere.community_id = communityId;
+
         const posts = await Post.findAndCountAll({
-            where: {
-                category: category,
-                [Op.or]: [
-                    { user_id: userId },        // 我发的
-                    { id: commentedPostIds }    // 我评论的
-                ]
-            },
+            where: baseWhere,
             offset: offset,
             limit: limit,
             order: [['createdAt', 'DESC']],
@@ -151,7 +267,7 @@ exports.getMyParticipatedPosts = async (req, res) => {
             ]
         });
 
-        res.json({ message: '获取成功', total: posts.count, page: page, limit: limit, data: posts.rows });
+        res.json(postsResponse(posts, page, limit));
     } catch (error) {
         console.error('获取参与数据失败:', error);
         res.status(500).json({ error: '获取参与数据失败' });
@@ -162,8 +278,33 @@ exports.getMyParticipatedPosts = async (req, res) => {
 exports.createPost = async (req, res) => {
     try {
         // req.user 来源于 authMiddleware
-        const userId = req.user.id;
+        const userId = resolveUserId(req.user && req.user.id);
+        if (!userId) return res.status(401).json({ error: '未登录' });
         const { content, location, category } = req.body;
+        const cat = category || req.query.category || '热门话题';
+
+        const user = await User.findByPk(userId, { attributes: ['community_id'] });
+        let commId = user && user.community_id != null ? parseInt(user.community_id, 10) : null;
+        if (!Number.isFinite(commId) || commId <= 0) commId = null;
+
+        const bodyCid = req.body.community_id != null ? req.body.community_id : req.body.communityId;
+        if (!commId && bodyCid != null && bodyCid !== '') {
+            const parsed = parseInt(bodyCid, 10);
+            if (Number.isFinite(parsed) && parsed > 0) {
+                commId = parsed;
+                if (user) {
+                    user.community_id = parsed;
+                    await user.save();
+                }
+            }
+        }
+
+        if (!commId) {
+            return res.status(400).json({
+                error: '请先绑定所属小区后再发帖',
+                errmsg: '请先在首页选择合川路等服务站点，或联系管理员绑定小区'
+            });
+        }
 
         // 解析通过 multer 上传的图片路径，或者直接使用前端传过来的已上传的图片URL数组
         let imagePaths = [];
@@ -180,8 +321,9 @@ exports.createPost = async (req, res) => {
         const newPost = await Post.create({
             user_id: userId,
             content: content || '',
-            category: category || '邻里互动',
-            images: imagePaths, // Sequelize 的 JSON 字段会自动处理数组
+            category: cat,
+            community_id: commId,
+            images: imagePaths,
             location: location || ''
         });
 
@@ -199,13 +341,14 @@ exports.createPost = async (req, res) => {
 // 3. 点赞/取消点赞
 exports.toggleLike = async (req, res) => {
     try {
-        const userId = req.user.id;
+        const userId = resolveUserId(req.user && req.user.id);
+        if (!userId) return res.status(401).json({ error: '未登录' });
         const postId = req.params.postId;
+        const viewerCommunityId = await resolveViewerCommunityId(req);
 
         const post = await Post.findByPk(postId);
-        if (!post) {
-            return res.status(404).json({ error: '帖子不存在' });
-        }
+        const vis = await assertPostVisibleToViewer(post, viewerCommunityId);
+        if (!vis.ok) return res.status(vis.status).json({ error: vis.error });
 
         // 查找是否已经点过赞
         const existingLike = await Like.findOne({
@@ -231,11 +374,10 @@ exports.toggleLike = async (req, res) => {
 // 4. 发表评论（支持 content、reply_to_user_id、image_urls）
 exports.addComment = async (req, res) => {
     try {
-        if (!req.user || !req.user.id) {
-            return res.status(401).json({ error: '未登录' });
-        }
-        const userId = req.user.id;
+        const userId = resolveUserId(req.user && req.user.id);
+        if (!userId) return res.status(401).json({ error: '未登录' });
         const postId = req.params.postId;
+        const viewerCommunityId = await resolveViewerCommunityId(req);
         const { content, reply_to_user_id, image_urls } = req.body;
 
         if (!content && (!image_urls || !Array.isArray(image_urls) || image_urls.length === 0)) {
@@ -243,9 +385,8 @@ exports.addComment = async (req, res) => {
         }
 
         const post = await Post.findByPk(postId);
-        if (!post) {
-            return res.status(404).json({ error: '帖子不存在' });
-        }
+        const vis = await assertPostVisibleToViewer(post, viewerCommunityId);
+        if (!vis.ok) return res.status(vis.status).json({ error: vis.error });
 
         const newComment = await Comment.create({
             post_id: postId,

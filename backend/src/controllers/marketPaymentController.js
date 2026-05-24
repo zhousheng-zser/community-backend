@@ -6,6 +6,10 @@ const {
 } = require('../models');
 const wechat = require('../utils/wechatPayV3');
 const { applyServiceOrderStatusAfterPayment } = require('../utils/serviceOrderPaidTransition');
+let commissionService = null;
+try {
+  commissionService = require('../modules/commission/services/commission.service');
+} catch (e) { /* optional */ }
 
 function ok(data) {
   return { code: 0, msg: 'ok', data };

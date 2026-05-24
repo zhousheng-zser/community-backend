@@ -1,5 +1,11 @@
 const { Op, QueryTypes } = require('sequelize');
 const { toAbsoluteAssetUrl } = require('../utils/assetUrl');
+const { resolveUserId } = require('../utils/resolveUserId');
+const { resolveServiceProviderProfile } = require('../utils/resolveServiceProviderProfile');
+const {
+  ensureWorkerVisibleInCommunity,
+  getHomeDisplayWorkerUserIds
+} = require('../services/workerVisibility.service');
 const {
   Category,
   Service,
@@ -15,7 +21,8 @@ const {
   ServiceOrderReview,
   MarketGood,
   ServiceOrder,
-  ServiceHomeModule
+  ServiceHomeModule,
+  ServiceItem
 } = require('../models');
 
 const ok = (res, data) => res.json({ errno: 0, data });
@@ -92,7 +99,7 @@ function normalizeServiceRow(s, req) {
     id: j.id,
     title: j.title,
     price: Number.isFinite(price) ? Math.round(price * 100) / 100 : j.price,
-    cover_image: req ? toAbsoluteAssetUrl(req, cover) : cover,
+    cover_image: cover,
     sales_count: j.sales_count != null ? Number(j.sales_count) : 0,
     category: cat.name ? { name: cat.name } : null
   };
@@ -114,7 +121,6 @@ function buildWorkerCard(user, profile, approvedApp, dispatchCount, extra = {}) 
   const resume = (profile && profile.resume) || (approvedApp && approvedApp.resume) || '';
   const workPhoto = (profile && profile.work_photo_url) || (approvedApp && approvedApp.work_photo_url) || '';
   const count = Number(extra.service_count != null ? extra.service_count : dispatchCount || 0);
-  const avatar = (profile && profile.work_photo_url) || user.avatar_url || workPhoto || '';
   const g = mapGender((profile && profile.gender) || extra.gender);
   return {
     id: user.id,
@@ -122,7 +128,9 @@ function buildWorkerCard(user, profile, approvedApp, dispatchCount, extra = {}) 
     real_name: realName,
     nickname: user.nickname || realName,
     avatar: user.avatar_url || '',
-    avatar_url: user.avatar_url || avatar || '',
+    avatar_url: user.avatar_url || '',
+    cover_image: workPhoto || '',
+    work_photo_url: workPhoto || '',
     skill: industry,
     industry,
     region: city,
@@ -233,11 +241,14 @@ function parseCommunityQuery(req) {
   return Number.isFinite(n) ? n : null;
 }
 
-/** 技工已绑定小区且请求带 community_id 时不一致则不可见 */
-function workerCommunityMismatch(profile, queryComm) {
-  if (queryComm == null) return false;
-  if (!profile || profile.community_id == null) return false;
-  return Number(profile.community_id) !== Number(queryComm);
+/** 从 query 或登录用户回填小区 ID（列表/详情/服务/评价共用） */
+async function resolveCommunityIdFromReq(req) {
+  let communityId = parseCommunityQuery(req);
+  if (!communityId && req.user && req.user.id) {
+    const u = await User.findByPk(req.user.id, { attributes: ['community_id'] });
+    communityId = u && u.community_id ? Number(u.community_id) : null;
+  }
+  return communityId;
 }
 
 const HOT_ORDER_STATUSES = ['paid_pending_dispatch', 'dispatched', 'in_service', 'completed'];
@@ -279,18 +290,38 @@ exports.getCategories = async (req, res) => {
   }
 };
 
+/** 热卖榜排除 E2E/地铁站等测试脏数据，优先有分类的真实服务 */
+function hotServiceListWhere(extra = {}) {
+  return {
+    ...publishedWhere(),
+    ...extra,
+    [Op.and]: [
+      { category_id: { [Op.not]: null } },
+      { title: { [Op.notLike]: '%测试%' } },
+      { title: { [Op.notLike]: '%E2E%' } },
+      { title: { [Op.notLike]: '%地铁站%' } },
+      { title: { [Op.notLike]: '%模拟%' } },
+      { title: { [Op.notLike]: '%家修急事-最快%' } }
+    ]
+  };
+}
+
 exports.getHotServices = async (req, res) => {
   try {
     let limit = parseInt(req.query.limit, 10);
     if (!Number.isFinite(limit) || limit < 1) limit = 10;
-    limit = Math.min(limit, 20);
+    limit = Math.min(limit, 80);
     const categoryId = req.query.category_id ? parseInt(req.query.category_id, 10) : null;
-    const where = { ...publishedWhere() };
+    const where = hotServiceListWhere();
     if (categoryId) where.category_id = categoryId;
     const services = await Service.findAll({
       where,
       limit,
-      order: [['sales_count', 'DESC'], ['id', 'DESC']],
+      order: [
+        [sequelize.literal("(CASE WHEN `Service`.`cover_image` LIKE '/uploads/%' THEN 0 WHEN `Service`.`id` >= 102 THEN 1 ELSE 2 END)"), 'ASC'],
+        ['sales_count', 'DESC'],
+        ['id', 'DESC']
+      ],
       include: [{ model: Category, as: 'category', attributes: ['name'] }]
     });
     return ok(res, services.map(normalizeServiceRow));
@@ -392,7 +423,7 @@ exports.getServiceHomeModules = async (req, res) => {
       return {
         group_key: j.group_key,
         title: j.title,
-        icon_url: toAbsoluteAssetUrl(req, icon) || icon,
+        icon_url: icon,
         price_unit: j.price_unit || '次',
         sort_order: j.sort_order != null ? j.sort_order : 0
       };
@@ -428,7 +459,7 @@ exports.getServiceGroup = async (req, res) => {
       const icon = x.icon_url || null;
       return {
         name: x.name,
-        icon_url: toAbsoluteAssetUrl(req, icon) || icon,
+        icon_url: icon,
         sort_order: x.sort_order != null ? x.sort_order : 0
       };
     });
@@ -446,20 +477,21 @@ exports.getServiceGroup = async (req, res) => {
 
 exports.getWorkers = async (req, res) => {
   try {
-    let communityId = req.query.community_id != null && req.query.community_id !== ''
-      ? parseInt(req.query.community_id, 10)
-      : null;
-    // 兼容旧前端：未传 community_id 时，尝试从登录用户默认小区回填
-    if (!communityId && req.user && req.user.id) {
-      const u = await User.findByPk(req.user.id, { attributes: ['community_id'] });
-      communityId = u && u.community_id ? Number(u.community_id) : null;
-    }
+    const communityId = await resolveCommunityIdFromReq(req);
     if (!communityId) return fail(res, 400, '请传 community_id 或登录后绑定默认小区');
 
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    let pageSize = parseInt(req.query.page_size, 10) || 20;
+    let pageSize = parseInt(req.query.page_size, 10) || parseInt(req.query.limit, 10) || 20;
     pageSize = Math.min(Math.max(pageSize, 1), 50);
-    const eligibleIds = await getListableWorkerUserIdsForCommunity(communityId);
+    let eligibleIds = await getListableWorkerUserIdsForCommunity(communityId);
+    const homeIds = await getHomeDisplayWorkerUserIds(communityId);
+    const eligibleSet = new Set(eligibleIds.map((id) => String(id)));
+    for (const uid of homeIds) {
+      if (!eligibleSet.has(String(uid))) {
+        await ensureWorkerVisibleInCommunity(uid, communityId);
+      }
+    }
+    eligibleIds = await getListableWorkerUserIdsForCommunity(communityId);
     if (eligibleIds.length === 0) return ok(res, { list: [], total: 0, page, page_size: pageSize });
 
     const whereUser = { id: { [Op.in]: eligibleIds } };
@@ -473,7 +505,10 @@ exports.getWorkers = async (req, res) => {
     const ids = users.map((u) => u.id);
     if (ids.length === 0) return ok(res, { list: [], total: count, page, page_size: pageSize });
 
-    const profiles = await WorkerProfile.findAll({ where: { user_id: { [Op.in]: ids } }, order: [['updated_at', 'DESC']] });
+    const profiles = await WorkerProfile.findAll({
+      where: { user_id: { [Op.in]: ids }, community_id: communityId },
+      order: [['updated_at', 'DESC']]
+    });
     const approvedApps = await WorkerApplication.findAll({ where: { user_id: { [Op.in]: ids }, status: 'approved' }, order: [['updated_at', 'DESC']] });
     const dispatchCounts = await HousekeepingDispatch.findAll({
       attributes: ['worker_id', [HousekeepingDispatch.sequelize.fn('COUNT', HousekeepingDispatch.sequelize.col('id')), 'cnt']],
@@ -504,15 +539,19 @@ exports.getWorkers = async (req, res) => {
 
 exports.getWorkerDetail = async (req, res) => {
   try {
-    const workerId = Number(req.params.id);
+    const workerId = resolveUserId(req.params.id);
     if (!workerId) return fail(res, 400, '无效技工 id');
+    const communityId = await resolveCommunityIdFromReq(req);
+    if (!communityId) return fail(res, 400, '请传 community_id 或登录后绑定默认小区');
     const listable = await assertWorkerListable(workerId);
     if (!listable) return fail(res, 404, '不存在', 404);
-    const qComm = parseCommunityQuery(req);
     const user = await User.findByPk(workerId, { attributes: ['id', 'nickname', 'avatar_url', 'phone', 'role'] });
     if (!user) return fail(res, 404, '不存在', 404);
-    const profile = await WorkerProfile.findOne({ where: { user_id: workerId, status: 'active' }, order: [['updated_at', 'DESC']] });
-    if (workerCommunityMismatch(profile, qComm)) return fail(res, 404, '不存在', 404);
+    const profile = await WorkerProfile.findOne({
+      where: { user_id: workerId, status: 'active', community_id: communityId },
+      order: [['updated_at', 'DESC']]
+    });
+    if (!profile) return fail(res, 404, '不存在', 404);
     const approvedApp = await WorkerApplication.findOne({ where: { user_id: workerId, status: 'approved' }, order: [['updated_at', 'DESC']] });
     const dispatchCount = await HousekeepingDispatch.count({ where: { worker_id: workerId } });
     const svcMap = await loadWorkerServiceCounts([workerId]);
@@ -540,11 +579,13 @@ exports.getWorkerDetail = async (req, res) => {
 
 exports.getServiceProviders = async (req, res) => {
   try {
-    const cid = parseCommunityQuery(req);
-    const where = { status: 'active' };
-    if (cid != null) {
-      where.community_id = cid;
+    let cid = parseCommunityQuery(req);
+    if (!cid && req.user && req.user.id) {
+      const u = await User.findByPk(req.user.id, { attributes: ['community_id'] });
+      cid = u && u.community_id != null ? Number(u.community_id) : null;
     }
+    if (!cid) return fail(res, 400, '请传 community_id 或登录后绑定默认小区');
+    const where = { status: 'active', community_id: cid };
     const rows = await ServiceProviderProfile.findAll({
       where,
       include: [{ model: User, as: 'user', attributes: ['id', 'nickname', 'avatar_url', 'phone'], required: false }],
@@ -575,19 +616,16 @@ exports.getServiceProviders = async (req, res) => {
 
 exports.getServiceProviderDetail = async (req, res) => {
   try {
-    const userId = Number(req.params.id);
-    if (!userId) return fail(res, 400, '无效 id');
-    const qComm = parseCommunityQuery(req);
-    const row = await ServiceProviderProfile.findOne({
-      where: { user_id: userId, status: 'active' },
-      include: [{ model: User, as: 'user', attributes: ['id', 'nickname', 'avatar_url', 'phone'], required: false }],
-      order: [['updated_at', 'DESC']]
-    });
+    const row = await resolveServiceProviderProfile(req.params.id);
     if (!row) return fail(res, 404, '不存在', 404);
+    const qComm = parseCommunityQuery(req);
     const rj = row.toJSON();
     if (qComm != null && rj.community_id != null && Number(rj.community_id) !== Number(qComm)) {
       return fail(res, 404, '不存在', 404);
     }
+    await row.reload({
+      include: [{ model: User, as: 'user', attributes: ['id', 'nickname', 'avatar_url', 'phone'], required: false }]
+    });
     return ok(res, {
       id: row.user_id,
       profile_id: row.id,
@@ -612,27 +650,33 @@ exports.getServiceProviderDetail = async (req, res) => {
 
 exports.getWorkerServices = async (req, res) => {
   try {
-    const workerId = Number(req.params.id);
+    const workerId = resolveUserId(req.params.id);
     if (!workerId) return fail(res, 400, '无效技工 id');
+    const communityId = await resolveCommunityIdFromReq(req);
+    if (!communityId) return fail(res, 400, '请传 community_id 或登录后绑定默认小区');
     const listable = await assertWorkerListable(workerId);
     if (!listable) return fail(res, 404, '不存在', 404);
-    const qComm = parseCommunityQuery(req);
-    const wfProf = await WorkerProfile.findOne({ where: { user_id: workerId, status: 'active' }, order: [['updated_at', 'DESC']] });
-    if (workerCommunityMismatch(wfProf, qComm)) return fail(res, 404, '不存在', 404);
+    const wfProf = await WorkerProfile.findOne({
+      where: { user_id: workerId, status: 'active', community_id: communityId },
+      order: [['updated_at', 'DESC']]
+    });
+    if (!wfProf) return fail(res, 404, '不存在', 404);
     const links = await WorkerService.findAll({
       where: { worker_user_id: workerId, enabled: 1 },
       include: [{
         model: Service,
         as: 'service',
-        required: true,
-        where: publishedWhere(),
-        include: [{ model: Category, as: 'category', attributes: ['name'] }]
+        required: false,
+        include: [{ model: Category, as: 'category', attributes: ['name'], required: false }]
       }],
       order: [['sort_order', 'ASC'], ['id', 'ASC']]
     });
     const list = links.map((l) => {
       const s = l.service;
       if (!s) return null;
+      const sj = s.toJSON ? s.toJSON() : s;
+      const pub = sj.is_published;
+      if (pub === 0 || pub === false) return null;
       const base = normalizeServiceRow(s);
       const j = s.toJSON ? s.toJSON() : s;
       return {
@@ -650,13 +694,17 @@ exports.getWorkerServices = async (req, res) => {
 
 exports.getWorkerReviews = async (req, res) => {
   try {
-    const workerId = Number(req.params.id);
+    const workerId = resolveUserId(req.params.id);
     if (!workerId) return fail(res, 400, '无效技工 id');
+    const communityId = await resolveCommunityIdFromReq(req);
+    if (!communityId) return fail(res, 400, '请传 community_id 或登录后绑定默认小区');
     const listable = await assertWorkerListable(workerId);
     if (!listable) return fail(res, 404, '不存在', 404);
-    const qComm = parseCommunityQuery(req);
-    const wrProf = await WorkerProfile.findOne({ where: { user_id: workerId, status: 'active' }, order: [['updated_at', 'DESC']] });
-    if (workerCommunityMismatch(wrProf, qComm)) return fail(res, 404, '不存在', 404);
+    const wrProf = await WorkerProfile.findOne({
+      where: { user_id: workerId, status: 'active', community_id: communityId },
+      order: [['updated_at', 'DESC']]
+    });
+    if (!wrProf) return fail(res, 404, '不存在', 404);
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     let limit = parseInt(req.query.limit, 10) || 10;
     limit = Math.min(Math.max(limit, 1), 50);
@@ -690,38 +738,68 @@ exports.getWorkerReviews = async (req, res) => {
 
 exports.getServiceProviderCatalog = async (req, res) => {
   try {
-    const userId = Number(req.params.id);
-    if (!userId) return fail(res, 400, '无效 id');
-    const qComm = parseCommunityQuery(req);
-    const row = await ServiceProviderProfile.findOne({
-      where: { user_id: userId, status: 'active' }
-    });
+    const row = await resolveServiceProviderProfile(req.params.id);
     if (!row) return fail(res, 404, '不存在', 404);
+    const qComm = parseCommunityQuery(req);
     const cj = row.toJSON();
     if (qComm != null && cj.community_id != null && Number(cj.community_id) !== Number(qComm)) {
       return fail(res, 404, '不存在', 404);
     }
     const pid = row.id;
-    const services = await Service.findAll({
-      where: { provider_id: pid, ...publishedWhere() },
-      include: [{ model: Category, as: 'category', attributes: ['name', 'group_type'] }],
-      order: [['sales_count', 'DESC'], ['id', 'ASC']]
-    });
+
+    // SP portal saves to service_items; legacy seed data is in services.
+    // Query service_items first; fall back to services if empty.
+    let catalogRows = [];
+    if (ServiceItem) {
+      try {
+        const items = await ServiceItem.findAll({
+          where: { provider_id: pid, is_published: 1 },
+          order: [['sort_order', 'ASC'], ['id', 'ASC']]
+        });
+        catalogRows = items.map((r) => {
+          const j = r.toJSON ? r.toJSON() : r;
+          return {
+            service_id: j.id,
+            title: j.title || j.name,
+            price: j.price != null ? String(j.price) : '',
+            cover_image: j.cover_image || j.main_image || null,
+            description: j.description ? String(j.description).slice(0, 200) : '',
+            _source: 'service_items'
+          };
+        });
+      } catch (_) {}
+    }
+
+    if (!catalogRows.length) {
+      const services = await Service.findAll({
+        where: { provider_id: pid, ...publishedWhere() },
+        include: [{ model: Category, as: 'category', attributes: ['name', 'group_type'] }],
+        order: [['sales_count', 'DESC'], ['id', 'ASC']]
+      });
+      catalogRows = services.map((svc) => {
+        const j = svc.toJSON();
+        return {
+          service_id: j.id,
+          title: j.title,
+          price: j.price != null ? String(j.price) : '',
+          cover_image: j.cover_image || null,
+          description: j.description ? String(j.description).slice(0, 200) : '',
+          _source: 'services'
+        };
+      });
+    }
+
     const groups = {};
-    services.forEach((svc) => {
-      const j = svc.toJSON();
-      const cat = j.category || {};
-      const gk = cat.group_type || 'default';
-      const label = GROUP_META[gk] ? GROUP_META[gk].title : (cat.name || gk);
-      if (!groups[gk]) {
-        groups[gk] = { group_key: gk, group_label: label, items: [] };
-      }
+    catalogRows.forEach((item) => {
+      const gk = 'default';
+      if (!groups[gk]) groups[gk] = { group_key: gk, group_label: '全部服务', items: [] };
       groups[gk].items.push({
-        service_id: j.id,
-        title: j.title,
-        price: j.price != null ? String(j.price) : '',
-        cover_image: j.cover_image || null,
-        description: j.description ? String(j.description).slice(0, 200) : ''
+        service_id: item.service_id,
+        title: item.title,
+        price: item.price,
+        cover_image: item.cover_image,
+        description: item.description,
+        _source: item._source
       });
     });
     return ok(res, { groups: Object.values(groups) });

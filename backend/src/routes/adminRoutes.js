@@ -35,6 +35,8 @@ router.get('/service-provider-applications', adminMarketController.listServicePr
 router.put('/service-provider-applications/:id', adminMarketController.updateServiceProviderApplication);
 router.post('/service-provider-portal-accounts', adminMarketController.createServiceProviderPortalAccount);
 router.get('/dispatch-queue', adminDispatchController.dispatchQueue);
+router.get('/housekeeping/workers', adminDispatchController.listAssignableWorkers);
+router.get('/dispatch/workers', adminDispatchController.listAssignableWorkers);
 router.get('/service-orders', adminDispatchController.listServiceOrders);
 router.post('/service-orders/:id/assign', adminDispatchController.assignServiceOrder);
 router.get('/neighbor-assist/orders', adminDispatchController.listNeighborAssistOrders);

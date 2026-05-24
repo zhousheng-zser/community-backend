@@ -13,6 +13,7 @@ const authMiddleware = require('../../middlewares/authMiddleware');
 router.use(authMiddleware);
 
 router.get('/me', ctrl.getMe);
+router.get('/application/me', ctrl.getApplicationMe);
 router.get('/my-downlines', ctrl.getMyDownlines);
 router.post('/apply', ctrl.apply);
 router.post('/refresh-chain', ctrl.refreshChain);

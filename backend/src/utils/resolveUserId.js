@@ -9,4 +9,12 @@ function resolveUserId(raw) {
   return id;
 }
 
-module.exports = { resolveUserId };
+/** 从 Express req 解析当前登录用户 id（管理员 token 返回 null） */
+function resolveUserIdFromReq(req) {
+  if (!req || !req.user) return null;
+  if (req.user.admin === true) return null;
+  const raw = req.user.id != null ? req.user.id : req.user.sub;
+  return resolveUserId(raw);
+}
+
+module.exports = { resolveUserId, resolveUserIdFromReq };
