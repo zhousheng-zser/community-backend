@@ -19,6 +19,7 @@ if (process.env.E2E_CLEAR_WX_SECRET === '1') {
 }
 const express = require('express');
 const cors = require('cors');
+const wechatPayV3 = require('./utils/wechatPayV3');
 
 const app = express();
 /** 与 admin Vite 代理默认 VITE_PROXY_TARGET=3001 一致，避免只起前端时 ECONNREFUSED */
@@ -169,6 +170,8 @@ const sslDir = path.join(__dirname, '..', 'ssl');
 const hasSsl = fs.existsSync(path.join(sslDir, 'key.pem')) && fs.existsSync(path.join(sslDir, 'cert.pem'));
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT, 10) || 3001;
 const HTTP_PORT = parseInt(process.env.HTTP_PORT, 10) || 3002;
+
+wechatPayV3.logWechatPayBootCheck();
 
 if (hasSsl) {
     const httpsOptions = {

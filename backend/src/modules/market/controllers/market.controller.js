@@ -1056,78 +1056,7 @@ exports.getLogistics = async (req, res) => {
   }
 };
 
-// POST /market/payments/create
-exports.createPayment = async (req, res) => {
-  try {
-    await ensureMarketTables();
-    const userId = getUserId(req);
-    if (!userId) return fail(res, '未登录', 401);
-    const orderNo = String((req.body || {}).order_no || '').trim();
-    if (!orderNo) return fail(res, '缺少 order_no');
-    const row = await MarketOrder.findOne({ where: { order_no: orderNo, user_id: userId } });
-    if (!row) return fail(res, '订单不存在', 404);
-    if (row.order_status !== 'pending_payment') return fail(res, '订单状态不可支付');
-    ok(res, {
-      order_no: orderNo,
-      out_trade_no: `PAY${Date.now()}`,
-      timeStamp: `${Math.floor(Date.now() / 1000)}`,
-      nonceStr: `ns_${Date.now()}`,
-      package: `prepay_id=mock_${Date.now()}`,
-      signType: 'MD5',
-      paySign: 'mock-signature'
-    });
-  } catch (err) {
-    console.error('[market/payments/create]', err);
-    fail(res, '创建支付失败', 500);
-  }
-};
-
-// GET /market/payments/status
-exports.getPaymentStatus = async (req, res) => {
-  try {
-    await ensureMarketTables();
-    const userId = getUserId(req);
-    if (!userId) return fail(res, '未登录', 401);
-    const orderNo = String(req.query.order_no || '').trim();
-    if (!orderNo) return fail(res, '缺少 order_no');
-    const row = await MarketOrder.findOne({ where: { order_no: orderNo, user_id: userId } });
-    if (!row) return fail(res, '订单不存在', 404);
-    ok(res, { order_no: orderNo, pay_status: row.pay_status, order_status: row.order_status });
-  } catch (err) {
-    console.error('[market/payments/status]', err);
-    fail(res, '查询支付状态失败', 500);
-  }
-};
-
-// POST /market/payments/mock-success
-exports.mockPaymentSuccess = async (req, res) => {
-  try {
-    await ensureMarketTables();
-    const userId = getUserId(req);
-    if (!userId) return fail(res, '未登录', 401);
-    const orderNo = String((req.body || {}).order_no || '').trim();
-    if (!orderNo) return fail(res, '缺少 order_no');
-    const row = await MarketOrder.findOne({ where: { order_no: orderNo, user_id: userId } });
-    if (!row) return fail(res, '订单不存在', 404);
-    if (row.order_status !== 'pending_payment') return fail(res, '当前订单不可模拟支付');
-    await row.update({ pay_status: 'paid', order_status: 'pending_accept', paid_at: new Date() });
-    await row.reload();
-    await orderPoints.grantPointsOnOrderPaid(MarketOrder, row, null);
-    try {
-      const payAmount = Number(row.payable_amount || row.pay_amount || row.total_amount || row.amount || 0);
-      const pool = Number(row.platform_fee_amount || 0);
-      if (payAmount > 0 && pool > 0) {
-        await commissionService.distributeCommission(row.order_no, 'market', payAmount, userId, pool);
-      } else if (payAmount > 0) {
-        await commissionService.distributeCommission(row.order_no, 'market', payAmount, userId);
-      }
-    } catch (ce) { console.warn('[market/commission]', ce.message); }
-    ok(res, { order_no: row.order_no, pay_status: row.pay_status, order_status: row.order_status }, '支付成功');
-  } catch (err) {
-    console.error('[market/payments/mock-success]', err);
-    fail(res, '模拟支付失败', 500);
-  }
-};
+// 支付接口已迁移至 marketPaymentController（见 modules/market/routes.js）
 
 // POST /market/orders/:orderNo/confirm-receipt
 exports.confirmReceipt = async (req, res) => {

@@ -6,6 +6,7 @@ const {
 } = require('../models');
 const wechat = require('../utils/wechatPayV3');
 const { applyServiceOrderStatusAfterPayment } = require('../utils/serviceOrderPaidTransition');
+const orderPoints = require('../services/orderPoints.service');
 let commissionService = null;
 try {
   commissionService = require('../modules/commission/services/commission.service');
@@ -19,9 +20,115 @@ function bizError(res, code, msg) {
   return res.status(200).json({ code, msg, data: null });
 }
 
+function getUserId(req) {
+  return req.user && req.user.id != null ? String(req.user.id) : null;
+}
+
+async function applyMarketOrderPaidSideEffects(order) {
+  try {
+    await orderPoints.grantPointsOnOrderPaid(MarketOrder, order, null);
+  } catch (pe) {
+    console.warn('[market/points]', pe.message);
+  }
+  if (!commissionService) return;
+  try {
+    const payAmount = Number(order.payable_amount || order.pay_amount || order.total_amount || order.amount || 0);
+    const pool = Number(order.platform_fee_amount || 0);
+    if (payAmount > 0 && pool > 0) {
+      await commissionService.distributeCommission(order.order_no, 'market', payAmount, order.user_id, pool);
+    } else if (payAmount > 0) {
+      await commissionService.distributeCommission(order.order_no, 'market', payAmount, order.user_id);
+    }
+  } catch (ce) {
+    console.warn('[market/commission]', ce.message);
+  }
+}
+
+/**
+ * 支付成功落库（回调 / V3 查单补偿共用，幂等）
+ * @param {object} tx MarketPayTransaction
+ * @param {object} payData 微信 plain 或查单结果（trade_state, transaction_id, success_time, out_trade_no）
+ * @param {{ source?: string, notifyRaw?: object }} opts
+ */
+async function applyMarketPaySuccess(tx, payData, opts = {}) {
+  const { source = 'callback', notifyRaw = null } = opts;
+  const tradeState = payData && payData.trade_state;
+
+  if (notifyRaw) {
+    tx.notify_raw = notifyRaw;
+    tx.notify_count = (tx.notify_count || 0) + 1;
+    tx.last_notify_at = new Date();
+  }
+
+  if (tx.pay_status === 'success') {
+    if (notifyRaw) await tx.save();
+    return { applied: false, idempotent: true };
+  }
+
+  if (tradeState && tradeState !== 'SUCCESS') {
+    tx.pay_status = 'failed';
+    if (notifyRaw) await tx.save();
+    return { applied: false, failed: true };
+  }
+
+  if (tradeState !== 'SUCCESS') {
+    return { applied: false };
+  }
+
+  tx.pay_status = 'success';
+  tx.transaction_id = payData.transaction_id || null;
+  tx.paid_at = payData.success_time ? new Date(payData.success_time) : new Date();
+  await tx.save();
+
+  if (tx.order_no && tx.order_no.startsWith('SO')) {
+    const { ServiceOrder } = require('../models');
+    const order = await ServiceOrder.findOne({ where: { order_no: tx.order_no } });
+    if (order && order.pay_status !== 'paid') {
+      order.pay_status = 'paid';
+      applyServiceOrderStatusAfterPayment(order);
+      await order.save();
+    }
+    return { applied: true, orderType: 'service' };
+  }
+
+  const order = await MarketOrder.findOne({ where: { order_no: tx.order_no } });
+  if (order && order.pay_status !== 'paid') {
+    order.pay_status = 'paid';
+    order.order_status = 'pending_accept';
+    order.paid_at = tx.paid_at;
+    await order.save();
+    await applyMarketOrderPaidSideEffects(order);
+    console.log(
+      `[market/pay] 落库成功 source=${source} order_no=${tx.order_no} out_trade_no=${tx.out_trade_no} tx=${payData.transaction_id || ''}`
+    );
+  }
+  return { applied: true, orderType: 'market' };
+}
+
+/** unpaid + tx created 时主动向微信查单并补偿落库 */
+async function trySyncPaymentFromWechat(order, tx) {
+  if (!order || order.pay_status === 'paid') return false;
+  if (!tx || tx.pay_status !== 'created' || !tx.out_trade_no) return false;
+  if (!wechat.isWechatPayConfigured()) return false;
+
+  try {
+    const wxData = await wechat.queryJsapiOrderByOutTradeNo(tx.out_trade_no);
+    if (wxData.trade_state !== 'SUCCESS') return false;
+    const result = await applyMarketPaySuccess(tx, wxData, {
+      source: 'status-query-sync',
+      notifyRaw: { source: 'payments/status-query-sync', wx: wxData }
+    });
+    return result.applied;
+  } catch (e) {
+    console.warn('[market/payments/status] V3 查单补偿失败:', tx.out_trade_no, e.message || e);
+    return false;
+  }
+}
+
 function genOutTradeNo(orderNo) {
   const rnd = Math.floor(Math.random() * 900000) + 100000;
-  return `MKPAY_${orderNo}_${Date.now()}_${rnd}`.slice(0, 64);
+  // 微信 out_trade_no 最长 32 字符
+  return `${Date.now()}${rnd}`.slice(0, 32);
 }
 
 function isVirtualPayWhenWechatMissing() {
@@ -72,13 +179,7 @@ async function virtualPaySuccessFlow(order, orderNo) {
   order.paid_at = now;
   await order.save();
 
-  // Distribute commission
-  if (commissionService) {
-    try {
-      const payAmount = Number(order.payable_amount || order.total_amount || 0);
-      if (payAmount > 0) await commissionService.distributeCommission(orderNo, 'market', payAmount, order.user_id);
-    } catch (ce) { console.warn('[market/commission]', ce.message); }
-  }
+  await applyMarketOrderPaidSideEffects(order);
 
   return { tx, wxPayParams: buildVirtualWxPayParams() };
 }
@@ -122,7 +223,8 @@ async function unifiedOrderWithRetry(tx, order, user) {
 // POST /api/v1/market/payments/create
 exports.createPayment = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = getUserId(req);
+    if (!userId) return bizError(res, 401, '未登录');
     const { order_no } = req.body;
     if (!order_no) return res.status(400).json({ code: 400, msg: '缺少 order_no', data: null });
 
@@ -187,6 +289,9 @@ exports.createPayment = async (req, res) => {
         pay_status: 'created',
         amount: order.payable_amount
       });
+    } else if (tx.out_trade_no && tx.out_trade_no.length > 32) {
+      tx.out_trade_no = genOutTradeNo(order_no);
+      await tx.save();
     }
 
     let prepayResp;
@@ -259,14 +364,22 @@ exports.createPaymentGetNotAllowed = async (req, res) => {
 // GET /api/v1/market/payments/status?order_no=xxx
 exports.getPaymentStatus = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const orderNo = req.query.order_no;
+    const userId = getUserId(req);
+    if (!userId) return bizError(res, 401, '未登录');
+    const orderNo = String(req.query.order_no || '').trim();
     if (!orderNo) return res.status(400).json({ code: 400, msg: '缺少 order_no', data: null });
 
     const order = await MarketOrder.findOne({ where: { order_no: orderNo, user_id: userId } });
     if (!order) return res.status(404).json({ code: 404, msg: '订单不存在', data: null });
 
     const tx = await MarketPayTransaction.findOne({ where: { order_no: orderNo }, order: [['created_at', 'DESC']] });
+
+    if (order.pay_status !== 'paid' && tx && tx.pay_status === 'created' && tx.out_trade_no) {
+      await trySyncPaymentFromWechat(order, tx);
+      await order.reload();
+      if (tx) await tx.reload();
+    }
+
     res.json(
       ok({
         order_no: orderNo,
@@ -309,13 +422,19 @@ exports.payCallback = async (req, res) => {
       try {
         parsed = await wechat.parsePayNotification(req.headers, rawStr);
       } catch (err) {
-        console.error('pay/callback v3 verify:', err.message);
+        const peek = wechat.tryPeekNotifyPlain(rawStr);
+        const serial = req.headers['wechatpay-serial'] || '';
+        console.error(
+          'pay/callback v3 verify:',
+          err.message,
+          peek ? `out_trade_no=${peek.out_trade_no}` : 'out_trade_no=unknown',
+          `serial=${serial}`
+        );
         return res.status(401).json({ code: 'FAIL', message: err.message || '验签失败' });
       }
 
       const { plain, outer } = parsed;
       const outTradeNo = plain.out_trade_no;
-      const tradeState = plain.trade_state;
 
       const tx = await MarketPayTransaction.findOne({ where: { out_trade_no: outTradeNo } });
       if (!tx) {
@@ -323,44 +442,10 @@ exports.payCallback = async (req, res) => {
         return res.status(200).json(wechat.wechatSuccessBody());
       }
 
-      tx.notify_raw = { v3_plain: plain, v3_outer: outer };
-      tx.notify_count = (tx.notify_count || 0) + 1;
-      tx.last_notify_at = new Date();
-
-      if (tx.pay_status === 'success') {
-        await tx.save();
-        return res.status(200).json(wechat.wechatSuccessBody());
-      }
-
-      if (tradeState !== 'SUCCESS') {
-        tx.pay_status = 'failed';
-        await tx.save();
-        return res.status(200).json(wechat.wechatSuccessBody());
-      }
-
-      tx.pay_status = 'success';
-      tx.transaction_id = plain.transaction_id || null;
-      tx.paid_at = plain.success_time ? new Date(plain.success_time) : new Date();
-      await tx.save();
-
-      // 根据订单号前缀区分订单类型：MK=本地集市, SO=到家服务
-      if (tx.order_no && tx.order_no.startsWith('SO')) {
-        const { ServiceOrder } = require('../models');
-        const order = await ServiceOrder.findOne({ where: { order_no: tx.order_no } });
-        if (order && order.pay_status !== 'paid') {
-          order.pay_status = 'paid';
-          applyServiceOrderStatusAfterPayment(order);
-          await order.save();
-        }
-      } else {
-        const order = await MarketOrder.findOne({ where: { order_no: tx.order_no } });
-        if (order && order.pay_status !== 'paid') {
-          order.pay_status = 'paid';
-          order.order_status = 'pending_accept';
-          order.paid_at = tx.paid_at;
-          await order.save();
-        }
-      }
+      await applyMarketPaySuccess(tx, plain, {
+        source: 'callback',
+        notifyRaw: { v3_plain: plain, v3_outer: outer }
+      });
 
       return res.status(200).json(wechat.wechatSuccessBody());
     }
@@ -383,46 +468,21 @@ exports.payCallback = async (req, res) => {
       return res.json({ code: 0, msg: 'SUCCESS', data: null });
     }
 
-    tx.notify_raw = req.body;
-    tx.notify_count = (tx.notify_count || 0) + 1;
-    tx.last_notify_at = new Date();
+    const legacyResult = await applyMarketPaySuccess(tx, {
+      trade_state,
+      transaction_id,
+      success_time: paid_at,
+      out_trade_no
+    }, {
+      source: 'legacy-callback',
+      notifyRaw: req.body
+    });
 
-    if (tx.pay_status === 'success') {
-      await tx.save();
-      return res.json({ code: 0, msg: 'SUCCESS', data: { idempotent: true } });
-    }
-
-    if (trade_state !== 'SUCCESS') {
-      tx.pay_status = 'failed';
-      await tx.save();
-      return res.json({ code: 0, msg: 'SUCCESS', data: null });
-    }
-
-    tx.pay_status = 'success';
-    tx.transaction_id = transaction_id || null;
-    tx.paid_at = paid_at ? new Date(paid_at) : new Date();
-    await tx.save();
-
-    // 根据订单号前缀区分订单类型
-    if (tx.order_no && tx.order_no.startsWith('SO')) {
-      const { ServiceOrder } = require('../models');
-      const order = await ServiceOrder.findOne({ where: { order_no: tx.order_no } });
-      if (order && order.pay_status !== 'paid') {
-        order.pay_status = 'paid';
-        applyServiceOrderStatusAfterPayment(order);
-        await order.save();
-      }
-    } else {
-      const order = await MarketOrder.findOne({ where: { order_no: tx.order_no } });
-      if (order && order.pay_status !== 'paid') {
-        order.pay_status = 'paid';
-        order.order_status = 'pending_accept';
-        order.paid_at = tx.paid_at;
-        await order.save();
-      }
-    }
-
-    return res.json({ code: 0, msg: 'SUCCESS', data: null });
+    return res.json({
+      code: 0,
+      msg: 'SUCCESS',
+      data: legacyResult.idempotent ? { idempotent: true } : null
+    });
   } catch (e) {
     console.error('pay/callback error:', e);
     return res.status(500).json({ code: 'FAIL', message: '处理失败' });
@@ -436,7 +496,8 @@ exports.mockSuccess = async (req, res) => {
       return res.status(403).json({ code: 403, msg: '生产环境禁用该接口', data: null });
     }
 
-    const userId = req.user.id;
+    const userId = getUserId(req);
+    if (!userId) return bizError(res, 401, '未登录');
     const { order_no, out_trade_no, transaction_id, paid_at } = req.body || {};
     if (!order_no && !out_trade_no) {
       return res.status(400).json({ code: 400, msg: '缺少 order_no 或 out_trade_no', data: null });
@@ -477,6 +538,7 @@ exports.mockSuccess = async (req, res) => {
       order.order_status = 'pending_accept';
       order.paid_at = tx.paid_at || new Date();
       await order.save();
+      await applyMarketOrderPaidSideEffects(order);
     }
 
     return res.json(

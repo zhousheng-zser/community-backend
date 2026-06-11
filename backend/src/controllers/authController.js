@@ -43,13 +43,30 @@ function jsonErr(res, status, msg) {
 /** POST /api/v1/auth/login — 微信已注册则登录，未注册则失败 */
 exports.login = async (req, res) => {
   try {
-    const { code, nickname, avatar_url } = req.body || {};
+    const { code, nickname, avatar_url, phone, sms_code } = req.body || {};
     if (!code) {
       return jsonErr(res, 400, '缺少 code 参数');
     }
 
     const openid = await resolveOpenidFromCode(code);
-    const user = await User.findOne({ where: { openid } });
+    let user = await User.findOne({ where: { openid } });
+
+    if (!user && phone && sms_code) {
+      if (!verifySmsCode(sms_code)) {
+        return jsonErr(res, 400, '验证码错误');
+      }
+      const phoneStr = String(phone).trim();
+      user = await User.findOne({ where: { phone: phoneStr } });
+      if (!user) {
+        return jsonErr(res, 404, '该手机号未注册');
+      }
+      const occupied = await User.findOne({ where: { openid } });
+      if (occupied && String(occupied.id) !== String(user.id)) {
+        return jsonErr(res, 409, '该微信已绑定其他账号');
+      }
+      user.openid = openid;
+      await user.save();
+    }
 
     if (!user) {
       return jsonErr(res, 404, '该微信尚未注册，请先完成手机号注册并绑定微信');
@@ -178,6 +195,47 @@ exports.register = async (req, res) => {
     }
     console.error('register error:', e);
     return jsonErr(res, 500, '注册失败');
+  }
+};
+
+/** POST /api/v1/auth/bind_wx — 已登录用户绑定/更新当前微信 openid（换 AppID 后使用） */
+exports.bindWx = async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) {
+      return jsonErr(res, 400, '缺少 code 参数');
+    }
+    const userId = String(req.user && req.user.id);
+    if (!userId) {
+      return jsonErr(res, 401, '请先登录');
+    }
+
+    const user = await User.findByPk(userId);
+    if (!user) {
+      return jsonErr(res, 404, '用户不存在');
+    }
+
+    const openid = await resolveOpenidFromCode(code);
+    const existing = await User.findOne({ where: { openid } });
+    if (existing && String(existing.id) !== userId) {
+      return jsonErr(res, 409, '该微信已绑定其他账号');
+    }
+
+    const oldOpenid = user.openid;
+    user.openid = openid;
+    await user.save();
+
+    return jsonOk(res, {
+      msg: '微信绑定成功',
+      user: formatUserPayload(user),
+      data: { old_openid: oldOpenid || null, openid }
+    });
+  } catch (error) {
+    if (error.status === 400) {
+      return res.status(400).json({ code: 400, error: error.message, details: error.details });
+    }
+    console.error('bindWx error:', error);
+    return jsonErr(res, 500, '绑定失败');
   }
 };
 

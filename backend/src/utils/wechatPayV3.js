@@ -14,6 +14,22 @@ const CERTS_PATH = '/v3/certificates';
 let platformCertCache = { serialToPem: {}, fetchedAt: 0 };
 const CERT_CACHE_MS = 12 * 60 * 60 * 1000;
 
+function envAppId() {
+  return process.env.WX_PAY_APPID || process.env.WX_APPID || process.env.WECHAT_APPID;
+}
+
+function envMchId() {
+  return process.env.WX_PAY_MCHID || process.env.WX_MCH_ID;
+}
+
+function envSerialNo() {
+  return process.env.WX_PAY_SERIAL_NO || process.env.WX_MCH_SERIAL_NO;
+}
+
+function envApiV3Key() {
+  return process.env.WX_PAY_API_V3_KEY || process.env.WX_API_V3_KEY;
+}
+
 function loadPrivateKeyPem() {
   const raw = process.env.WX_PAY_PRIVATE_KEY;
   const keyPath = process.env.WX_PAY_PRIVATE_KEY_PATH;
@@ -27,17 +43,31 @@ function loadPrivateKeyPem() {
   return null;
 }
 
+function isValidPublicKeyPem(pem) {
+  if (!pem || typeof pem !== 'string') return false;
+  const trimmed = pem.trim();
+  if (!trimmed.includes('BEGIN PUBLIC KEY')) return false;
+  if (/在此粘贴|placeholder|replace_me|示例/i.test(trimmed)) return false;
+  try {
+    crypto.createPublicKey(trimmed);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function getWechatPayConfigStatus() {
   const missing = [];
-  const appid = process.env.WX_PAY_APPID || process.env.WECHAT_APPID;
-  const mchid = process.env.WX_PAY_MCHID;
-  const serial = process.env.WX_PAY_SERIAL_NO;
-  const apiV3 = process.env.WX_PAY_API_V3_KEY;
+  const warnings = [];
+  const appid = envAppId();
+  const mchid = envMchId();
+  const serial = envSerialNo();
+  const apiV3 = envApiV3Key();
   const notifyUrl = process.env.WX_PAY_NOTIFY_URL;
-  if (!appid) missing.push('WX_PAY_APPID 或 WECHAT_APPID');
-  if (!mchid) missing.push('WX_PAY_MCHID');
-  if (!serial) missing.push('WX_PAY_SERIAL_NO');
-  if (!apiV3) missing.push('WX_PAY_API_V3_KEY');
+  if (!appid) missing.push('WX_PAY_APPID / WX_APPID / WECHAT_APPID');
+  if (!mchid) missing.push('WX_PAY_MCHID / WX_MCH_ID');
+  if (!serial) missing.push('WX_PAY_SERIAL_NO / WX_MCH_SERIAL_NO');
+  if (!apiV3) missing.push('WX_PAY_API_V3_KEY / WX_API_V3_KEY');
   if (!notifyUrl) missing.push('WX_PAY_NOTIFY_URL');
   if (apiV3 && String(apiV3).length !== 32) missing.push('WX_PAY_API_V3_KEY(必须32位)');
 
@@ -50,11 +80,30 @@ function getWechatPayConfigStatus() {
   }
   if (!pem) missing.push('WX_PAY_PRIVATE_KEY_PATH 或 WX_PAY_PRIVATE_KEY');
 
+  const publicKeyPem = loadWechatPayPublicKeyPem();
+  const publicKeyId = envWechatPayPublicKeyId();
+  if (publicKeyId && !isValidPublicKeyPem(publicKeyPem)) {
+    warnings.push(
+      'WX_PAY_PUBLIC_KEY 未配置或无效（回调验签将失败）；请在商户平台下载公钥并配置 WX_PAY_PUBLIC_KEY / WX_PAY_PUBLIC_KEY_ID'
+    );
+  }
+
   return {
     ok: missing.length === 0 && !privateKeyLoadError,
     missing,
-    privateKeyLoadError
+    privateKeyLoadError,
+    warnings,
+    publicKeyConfigured: isValidPublicKeyPem(publicKeyPem)
   };
+}
+
+/** 启动时打印微信支付配置告警 */
+function logWechatPayBootCheck() {
+  if (!isWechatPayConfigured()) return;
+  const cfg = getWechatPayConfigStatus();
+  if (cfg.warnings && cfg.warnings.length) {
+    cfg.warnings.forEach((w) => console.error('[wechat-pay] 配置告警:', w));
+  }
 }
 
 function isWechatPayConfigured() {
@@ -62,12 +111,12 @@ function isWechatPayConfigured() {
 }
 
 function getWxAppId() {
-  return process.env.WX_PAY_APPID || process.env.WECHAT_APPID;
+  return envAppId();
 }
 
 function buildAuthHeader(method, urlPath, bodyStr) {
-  const mchid = process.env.WX_PAY_MCHID;
-  const serial = process.env.WX_PAY_SERIAL_NO;
+  const mchid = envMchId();
+  const serial = envSerialNo();
   const pem = loadPrivateKeyPem();
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const nonceStr = crypto.randomBytes(16).toString('hex');
@@ -123,8 +172,31 @@ function decryptAes256Gcm(apiV3Key, associatedData, nonceStr, ciphertextB64) {
   return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
 }
 
+function loadWechatPayPublicKeyPem() {
+  const raw = process.env.WX_PAY_PUBLIC_KEY;
+  const keyPath = process.env.WX_PAY_PUBLIC_KEY_PATH;
+  if (raw && String(raw).trim()) {
+    return raw.replace(/\\n/g, '\n');
+  }
+  if (keyPath) {
+    const p = path.isAbsolute(keyPath) ? keyPath : path.join(process.cwd(), keyPath);
+    if (fs.existsSync(p)) {
+      return fs.readFileSync(p, 'utf8');
+    }
+  }
+  return null;
+}
+
+function envWechatPayPublicKeyId() {
+  return process.env.WX_PAY_PUBLIC_KEY_ID || process.env.WX_PAY_PLATFORM_PUBLIC_KEY_ID;
+}
+
+function isWechatPayPublicKeySerial(serial) {
+  return serial && String(serial).startsWith('PUB_KEY_ID_');
+}
+
 async function refreshPlatformCertificates() {
-  const apiV3Key = process.env.WX_PAY_API_V3_KEY;
+  const apiV3Key = envApiV3Key();
   const data = await wechatRequest('GET', CERTS_PATH, null);
   const serialToPem = {};
   for (const row of data.data || []) {
@@ -143,16 +215,45 @@ async function refreshPlatformCertificates() {
 }
 
 async function getPlatformPemForSerial(serial) {
+  const publicKeyId = envWechatPayPublicKeyId();
+  const publicKeyPem = loadWechatPayPublicKeyPem();
+  if (publicKeyPem && publicKeyId && serial === publicKeyId) {
+    return publicKeyPem;
+  }
+  if (isWechatPayPublicKeySerial(serial) && publicKeyPem) {
+    if (!publicKeyId || serial === publicKeyId) {
+      return publicKeyPem;
+    }
+  }
+
   const now = Date.now();
   if (!platformCertCache.serialToPem[serial] || now - platformCertCache.fetchedAt > CERT_CACHE_MS) {
-    await refreshPlatformCertificates();
+    try {
+      await refreshPlatformCertificates();
+    } catch (e) {
+      const msg = (e.body && e.body.message) || e.message || '';
+      if (publicKeyPem && (isWechatPayPublicKeySerial(serial) || (publicKeyId && serial === publicKeyId))) {
+        return publicKeyPem;
+      }
+      if (/无可用的平台证书|RESOURCE_NOT_EXISTS/i.test(msg)) {
+        throw new Error(
+          `${msg}。请在商户平台下载「微信支付公钥」并配置 WX_PAY_PUBLIC_KEY_ID、WX_PAY_PUBLIC_KEY_PATH`
+        );
+      }
+      throw e;
+    }
   }
   let pem = platformCertCache.serialToPem[serial];
   if (!pem) {
-    await refreshPlatformCertificates();
+    try {
+      await refreshPlatformCertificates();
+    } catch (e) {
+      if (publicKeyPem && isWechatPayPublicKeySerial(serial)) return publicKeyPem;
+      throw e;
+    }
     pem = platformCertCache.serialToPem[serial];
   }
-  if (!pem) throw new Error(`找不到平台证书 serial=${serial}`);
+  if (!pem) throw new Error(`找不到平台证书或公钥 serial=${serial}`);
   return pem;
 }
 
@@ -174,7 +275,7 @@ async function verifyWechatpaySignature({ timestamp, nonce, bodyStr, serial, sig
  */
 async function jsapiUnifiedOrder(p) {
   const appid = getWxAppId();
-  const mchid = process.env.WX_PAY_MCHID;
+  const mchid = envMchId();
   const body = {
     appid,
     mchid,
@@ -235,7 +336,7 @@ async function parsePayNotification(headers, rawBodyStr) {
   if (!resource || resource.algorithm !== 'AEAD_AES_256_GCM') {
     throw new Error('通知 resource 格式异常');
   }
-  const apiV3Key = process.env.WX_PAY_API_V3_KEY;
+  const apiV3Key = envApiV3Key();
   const jsonStr = decryptAes256Gcm(
     apiV3Key,
     resource.associated_data || '',
@@ -252,13 +353,49 @@ function yuanToFen(yuan) {
   return Math.round(n * 100);
 }
 
+/**
+ * V3 查单：按商户单号查询 JSAPI 订单
+ * @see https://pay.weixin.qq.com/doc/v3/merchant/4012791868
+ */
+async function queryJsapiOrderByOutTradeNo(outTradeNo) {
+  const mchid = envMchId();
+  if (!mchid) throw new Error('缺少 WX_PAY_MCHID');
+  const out = encodeURIComponent(String(outTradeNo).trim());
+  const urlPath = `/v3/pay/transactions/out-trade-no/${out}?mchid=${mchid}`;
+  return wechatRequest('GET', urlPath, null);
+}
+
+/** 验签失败时尝试解密通知体，仅用于日志（不替代验签） */
+function tryPeekNotifyPlain(rawBodyStr) {
+  if (!rawBodyStr) return null;
+  try {
+    const outer = JSON.parse(rawBodyStr);
+    const resource = outer.resource;
+    if (!resource || resource.algorithm !== 'AEAD_AES_256_GCM') return null;
+    const apiV3Key = envApiV3Key();
+    const jsonStr = decryptAes256Gcm(
+      apiV3Key,
+      resource.associated_data || '',
+      resource.nonce,
+      resource.ciphertext
+    );
+    return JSON.parse(jsonStr);
+  } catch (e) {
+    return null;
+  }
+}
+
 module.exports = {
   isWechatPayConfigured,
   getWechatPayConfigStatus,
+  logWechatPayBootCheck,
+  isValidPublicKeyPem,
   getWxAppId,
   jsapiUnifiedOrder,
   buildJsapiPayParams,
   parsePayNotification,
+  queryJsapiOrderByOutTradeNo,
+  tryPeekNotifyPlain,
   yuanToFen,
   wechatSuccessBody: () => ({ code: 'SUCCESS', message: '成功' })
 };

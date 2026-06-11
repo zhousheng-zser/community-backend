@@ -18,6 +18,9 @@ router.post('/login_sms', authController.loginSms);
 router.post('/login_password', authController.loginPassword);
 router.post('/login_sms', authController.loginSms);
 
+// POST /api/v1/auth/bind_wx — 已登录用户更新微信 openid（换 AppID 后）
+router.post('/bind_wx', authMiddleware, authController.bindWx);
+
 // POST /api/v1/auth/logout
 router.post('/logout', authMiddleware, authController.logout);
 

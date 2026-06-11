@@ -3,6 +3,7 @@ const router = express.Router();
 const authMiddleware = require('../../middlewares/authMiddleware');
 const ctrl = require('./controllers/market.controller');
 const deliveryCtrl = require('./controllers/marketDelivery.controller');
+const paymentCtrl = require('../../controllers/marketPaymentController');
 
 // 6.1 商家入驻
 router.post('/apply', authMiddleware, ctrl.apply);
@@ -40,10 +41,12 @@ router.get('/orders/:orderNo/delivery/track', authMiddleware, deliveryCtrl.buyer
 router.post('/delivery/webhook/meituan', deliveryCtrl.webhookMeituan);
 router.post('/delivery/webhook/eleme', deliveryCtrl.webhookEleme);
 
-// 6.5 支付
-router.post('/payments/create', authMiddleware, ctrl.createPayment);
-router.get('/payments/status', authMiddleware, ctrl.getPaymentStatus);
-router.post('/payments/mock-success', authMiddleware, ctrl.mockPaymentSuccess);
+// 6.5 支付（微信 API v3 真实支付，见 marketPaymentController）
+router.post('/pay/callback', paymentCtrl.payCallback);
+router.get('/payments/create', paymentCtrl.createPaymentGetNotAllowed);
+router.post('/payments/create', authMiddleware, paymentCtrl.createPayment);
+router.get('/payments/status', authMiddleware, paymentCtrl.getPaymentStatus);
+router.post('/payments/mock-success', authMiddleware, paymentCtrl.mockSuccess);
 
 // 6.6 收货与退款
 router.post('/orders/:orderNo/confirm-receipt', authMiddleware, ctrl.confirmReceipt);

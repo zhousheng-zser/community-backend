@@ -15,9 +15,14 @@ function bizError(res, code, msg) {
   return res.status(200).json({ code, msg, data: null });
 }
 
+function getUserId(req) {
+  return req.user && req.user.id != null ? String(req.user.id) : null;
+}
+
 function genOutTradeNo(orderNo) {
   const rnd = Math.floor(Math.random() * 900000) + 100000;
-  return `SOPAY_${orderNo}_${Date.now()}_${rnd}`.slice(0, 64);
+  // 微信 out_trade_no 最长 32 字符
+  return `${Date.now()}${rnd}`.slice(0, 32);
 }
 
 function isVirtualPayWhenWechatMissing() {
@@ -109,7 +114,8 @@ async function unifiedOrderWithRetry(tx, order, user) {
 // POST /api/v1/service-orders/payments/create
 exports.createPayment = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = getUserId(req);
+    if (!userId) return bizError(res, 401, '未登录');
     const { order_no } = req.body;
     if (!order_no) return res.status(400).json({ code: 400, msg: '缺少 order_no', data: null });
 
@@ -174,6 +180,9 @@ exports.createPayment = async (req, res) => {
         pay_status: 'created',
         amount: order.amount
       });
+    } else if (tx.out_trade_no && tx.out_trade_no.length > 32) {
+      tx.out_trade_no = genOutTradeNo(order_no);
+      await tx.save();
     }
 
     let prepayResp;
@@ -235,7 +244,8 @@ exports.createPayment = async (req, res) => {
 // GET /api/v1/service-orders/payments/status?order_no=xxx
 exports.getPaymentStatus = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = getUserId(req);
+    if (!userId) return bizError(res, 401, '未登录');
     const orderNo = req.query.order_no;
     if (!orderNo) return res.status(400).json({ code: 400, msg: '缺少 order_no', data: null });
 
@@ -266,7 +276,8 @@ exports.mockSuccess = async (req, res) => {
       return res.status(403).json({ code: 403, msg: '生产环境禁用该接口', data: null });
     }
 
-    const userId = req.user.id;
+    const userId = getUserId(req);
+    if (!userId) return bizError(res, 401, '未登录');
     const { order_no, out_trade_no, transaction_id, paid_at } = req.body || {};
     if (!order_no && !out_trade_no) {
       return res.status(400).json({ code: 400, msg: '缺少 order_no 或 out_trade_no', data: null });
