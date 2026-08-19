@@ -7,6 +7,7 @@
 const db = require('../models');
 const meituan = require('./delivery/meituanPeisong.client');
 const fengniao = require('./delivery/fengniaoDelivery.client');
+const shopBinding = require('./shopDeliveryBinding.service');
 
 const PROVIDERS = {
   self: { code: 'self', name: '商家自配送', brand: '自配送' },
@@ -41,24 +42,35 @@ function useMock() {
   return false;
 }
 
-function providerConfigured(provider) {
+async function providerConfigured(provider, shopId) {
   if (provider === 'self') return true;
-  if (provider === 'meituan') return meituan.isConfigured();
-  if (provider === 'eleme') return fengniao.isConfigured();
+  if (shopId != null) {
+    return shopBinding.isShopProviderReady(shopId, provider);
+  }
+  if (provider === 'meituan') return meituan.isConfigured() && !!shopBinding.envFallbackShopId('meituan');
+  if (provider === 'eleme') return fengniao.isConfigured() && !!shopBinding.envFallbackShopId('eleme');
   return false;
 }
 
-function shouldUseMock(provider) {
+async function shouldUseMock(provider, shopId) {
   if (useMock()) return true;
+  if (process.env.DELIVERY_MOCK === '0') return false;
   if (!provider) {
+    if (shopId != null) {
+      const mt = await providerConfigured('meituan', shopId);
+      const el = await providerConfigured('eleme', shopId);
+      return !(mt || el);
+    }
     return !(meituan.isConfigured() || fengniao.isConfigured());
   }
-  return !providerConfigured(provider);
+  return !(await providerConfigured(provider, shopId));
 }
 
-/** 商家选项页：是否展示为模拟模式 */
+/** 商家选项页：是否展示为模拟模式（不依赖具体店铺） */
 function isGlobalMockMode() {
-  return shouldUseMock(null);
+  if (useMock()) return true;
+  if (process.env.DELIVERY_MOCK === '0') return false;
+  return !(meituan.isConfigured() || fengniao.isConfigured());
 }
 
 async function ensureDeliveryTables() {
@@ -188,7 +200,8 @@ async function syncMockProgress(job) {
 }
 
 async function callThirdPartyCreate(provider, order, shop) {
-  if (shouldUseMock(provider)) {
+  const shopId = order.shop_id;
+  if (await shouldUseMock(provider, shopId)) {
     const prefix = provider === 'meituan' ? 'MT' : 'ELM';
     return {
       external_order_no: `${prefix}${Date.now()}`,
@@ -216,8 +229,12 @@ async function callThirdPartyCreate(provider, order, shop) {
   };
 
   if (provider === 'meituan') {
+    const externalShopId = await shopBinding.resolveExternalShopId(shopId, 'meituan');
+    if (!externalShopId) {
+      throw new Error('该店未绑定美团配送门店，请先在商家后台完成绑定');
+    }
     const deliveryId = Date.now();
-    const created = await meituan.createByShop(ctx);
+    const created = await meituan.createByShop({ ...ctx, shopId: externalShopId, deliveryId });
     return {
       external_order_no: created.external_order_no,
       fee: created.fee,
@@ -225,19 +242,26 @@ async function callThirdPartyCreate(provider, order, shop) {
       payload: {
         delivery_id: created.delivery_id,
         mt_peisong_id: created.external_order_no,
-        order_id: created.order_id
+        order_id: created.order_id,
+        shop_id: externalShopId
       }
     };
   }
 
   if (provider === 'eleme') {
-    const created = await fengniao.createOrder(ctx);
+    const chainStoreCode = await shopBinding.resolveExternalShopCode(shopId, 'eleme')
+      || await shopBinding.resolveExternalShopId(shopId, 'eleme');
+    if (!chainStoreCode) {
+      throw new Error('该店未绑定饿了么蜂鸟门店，请先在商家后台完成绑定');
+    }
+    const created = await fengniao.createOrder({ ...ctx, chainStoreCode });
     return {
       external_order_no: created.external_order_no,
       fee: created.fee,
       mock: false,
       payload: {
-        partner_order_code: created.partner_order_code
+        partner_order_code: created.partner_order_code,
+        chain_store_code: chainStoreCode
       }
     };
   }
@@ -247,7 +271,7 @@ async function callThirdPartyCreate(provider, order, shop) {
 
 async function syncThirdPartyProgress(job, order) {
   const payload = parsePayload(job);
-  if (shouldUseMock(job.provider)) {
+  if (await shouldUseMock(job.provider, job.shop_id)) {
     return syncMockProgress(job);
   }
 
@@ -357,7 +381,7 @@ async function syncJobProgress(job, order) {
     job = await syncThirdPartyProgress(job, order);
   } catch (e) {
     console.error('[delivery/sync]', job.provider, job.order_no, e.message);
-    if (shouldUseMock(job.provider)) {
+    if (await shouldUseMock(job.provider, job.shop_id)) {
       job = await syncMockProgress(job);
     }
   }
@@ -401,7 +425,7 @@ async function getDeliveryView(orderNo) {
     rider_name: job.rider_name,
     rider_phone: job.rider_phone,
     fee_amount: Number(job.fee_amount || 0).toFixed(2),
-    mock_mode: shouldUseMock(job.provider),
+    mock_mode: await shouldUseMock(job.provider, job.shop_id),
     timeline: tracks.map((t) => ({
       status_code: t.status_code,
       status_text: t.status_text,
@@ -502,6 +526,33 @@ function listProviderOptions(deliveryMode) {
   return base;
 }
 
+async function listProviderOptionsForShop(deliveryMode, shopId) {
+  const base = [
+    { code: 'self', name: '商家自配送', desc: '由店铺自行送货或通知用户自提', available: true }
+  ];
+  if (deliveryMode === 'pickup') return base;
+
+  const mockGlobal = await shouldUseMock(null, shopId);
+  for (const item of [
+    { code: 'meituan', name: '美团配送', desc: '呼叫美团骑手，双方可查看配送进度' },
+    { code: 'eleme', name: '饿了么配送', desc: '呼叫饿了么骑手，双方可查看配送进度' }
+  ]) {
+    const binding = shopId != null ? await shopBinding.getBinding(shopId, item.code) : null;
+    const hasBinding = binding && binding.status === 'active';
+    const credReady = shopBinding.isPlatformCredentialsReady(item.code);
+    const ready = shopId != null ? await shopBinding.isShopProviderReady(shopId, item.code) : credReady;
+    base.push({
+      ...item,
+      available: ready || (mockGlobal && hasBinding),
+      platform_configured: credReady,
+      bound: !!hasBinding,
+      external_shop_id: binding ? binding.external_shop_id : null,
+      mock_eligible: mockGlobal && hasBinding
+    });
+  }
+  return base;
+}
+
 module.exports = {
   PROVIDERS,
   STATUS_LABELS,
@@ -513,5 +564,6 @@ module.exports = {
   completeSelfDelivery,
   handleWebhook,
   listProviderOptions,
+  listProviderOptionsForShop,
   providerConfigured
 };

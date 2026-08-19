@@ -12,13 +12,16 @@ function getConfig() {
     shopId: process.env.MEITUAN_SHOP_ID || '',
     serviceCode: parseInt(process.env.MEITUAN_SERVICE_CODE || '4012', 10),
     payTypeCode: parseInt(process.env.MEITUAN_PAY_TYPE || '0', 10),
-    orderSource: process.env.MEITUAN_ORDER_SOURCE || '202'
+    orderSource: process.env.MEITUAN_ORDER_SOURCE || '202',
+    shopCategory: parseInt(process.env.MEITUAN_SHOP_CATEGORY || '110', 10),
+    shopSecondCategory: parseInt(process.env.MEITUAN_SHOP_SECOND_CATEGORY || '110001', 10)
   };
 }
 
+/** 平台级 AppKey/Secret 是否已配置（不再要求全局 MEITUAN_SHOP_ID） */
 function isConfigured() {
   const c = getConfig();
-  return !!(c.appKey && c.secret && c.shopId);
+  return !!(c.appKey && c.secret);
 }
 
 /** 美团配送签名：secret + 按 key 排序拼接 key+value，SHA1 小写 */
@@ -60,11 +63,62 @@ async function invoke(method, bizParams) {
 }
 
 /**
+ * 创建门店 shop/create
+ * @see https://peisong.meituan.com/open/doc
+ */
+async function createShop(shopInfo) {
+  const cfg = getConfig();
+  const shopLng = toCoordInt(shopInfo.shopLng);
+  const shopLat = toCoordInt(shopInfo.shopLat);
+  if (!shopLng || !shopLat) {
+    throw new Error('门店坐标缺失，无法注册美团门店');
+  }
+  const serviceCodes = String(shopInfo.deliveryServiceCodes || cfg.serviceCode);
+  const biz = {
+    shop_id: String(shopInfo.shopId),
+    shop_name: String(shopInfo.shopName || '门店').slice(0, 50),
+    category: shopInfo.category != null ? Number(shopInfo.category) : cfg.shopCategory,
+    second_category: shopInfo.secondCategory != null ? Number(shopInfo.secondCategory) : cfg.shopSecondCategory,
+    contact_name: String(shopInfo.contactName || '联系人').slice(0, 32),
+    contact_phone: String(shopInfo.contactPhone || '').slice(0, 64),
+    shop_address: String(shopInfo.shopAddress || '').slice(0, 60),
+    shop_lng: shopLng,
+    shop_lat: shopLat,
+    coordinate_type: 0,
+    delivery_service_codes: serviceCodes,
+    business_hours: shopInfo.businessHours || '[{"beginTime":"00:00","endTime":"24:00"}]'
+  };
+  if (shopInfo.shopAddressDetail) {
+    biz.shop_address_detail = String(shopInfo.shopAddressDetail).slice(0, 60);
+  }
+  if (shopInfo.pickupAddressDesc) {
+    biz.pickup_address_desc = String(shopInfo.pickupAddressDesc).slice(0, 50);
+  }
+  const data = await invoke('shop/create', biz);
+  return {
+    shop_id: data.shop_id,
+    status: data.status,
+    raw: data
+  };
+}
+
+async function queryShop(shopId) {
+  const data = await invoke('shop/query', {
+    shop_id: String(shopId)
+  });
+  return data;
+}
+
+/**
  * 门店发单 order/createByShop
  * @see https://peisong.meituan.com/open/doc
  */
 async function createByShop(ctx) {
   const cfg = getConfig();
+  const shopId = ctx.shopId || cfg.shopId;
+  if (!shopId) {
+    throw new Error('美团发单缺少 shop_id，请先在店铺绑定美团门店');
+  }
   const deliveryId = ctx.deliveryId || Date.now();
   const goodsDetail = JSON.stringify({
     goods: (ctx.items || [{ goodName: '集市商品', goodCount: 1, goodPrice: Number(ctx.goodsValue || 0) }]).map((it) => ({
@@ -78,8 +132,8 @@ async function createByShop(ctx) {
     delivery_id: deliveryId,
     order_id: String(ctx.orderId).slice(0, 32),
     outer_order_source_desc: cfg.orderSource,
-    shop_id: cfg.shopId,
-    delivery_service_code: cfg.serviceCode,
+    shop_id: String(shopId),
+    delivery_service_code: ctx.serviceCode || cfg.serviceCode,
     receiver_name: String(ctx.receiverName || '收货人').slice(0, 256),
     receiver_address: String(ctx.receiverAddress || '').slice(0, 512),
     receiver_phone: String(ctx.receiverPhone || '').slice(0, 64),
@@ -137,6 +191,8 @@ module.exports = {
   getConfig,
   isConfigured,
   buildSign,
+  createShop,
+  queryShop,
   createByShop,
   queryStatus,
   verifyWebhookSign,

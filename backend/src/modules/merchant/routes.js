@@ -31,6 +31,9 @@ router.post('/orders/:orderNo/complete-delivery', (req, res, next) => { req.body
 router.get('/orders/:orderNo/delivery/options', deliveryCtrl.merchantOptions);
 router.post('/orders/:orderNo/delivery/launch', deliveryCtrl.merchantLaunch);
 router.get('/orders/:orderNo/delivery/track', deliveryCtrl.merchantTrack);
+router.get('/delivery/bindings', deliveryCtrl.merchantBindings);
+router.post('/delivery/bindings/meituan/register', deliveryCtrl.merchantBindMeituanRegister);
+router.post('/delivery/bindings/meituan/test', deliveryCtrl.merchantBindMeituanTest);
 router.get('/payments', ctrl.getPayments);
 router.get('/balance', ctrl.getBalance);
 router.post('/withdraw', ctrl.withdraw);

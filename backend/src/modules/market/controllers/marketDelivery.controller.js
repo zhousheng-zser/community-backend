@@ -2,6 +2,7 @@
 
 const db = require('../../../models');
 const delivery = require('../../../services/marketDelivery.service');
+const shopBinding = require('../../../services/shopDeliveryBinding.service');
 const { resolveUserIdFromReq } = require('../../../utils/resolveUserId');
 
 const ok = (res, data, msg = 'ok') => res.json({ code: 0, msg, data });
@@ -73,8 +74,9 @@ exports.merchantOptions = async (req, res) => {
       order_no: orderNo,
       delivery_mode: order.delivery_mode,
       current_carrier: order.delivery_carrier,
-      providers: delivery.listProviderOptions(order.delivery_mode),
-      mock_mode: delivery.useMock()
+      providers: await delivery.listProviderOptionsForShop(order.delivery_mode, shop.id),
+      mock_mode: delivery.useMock(),
+      shop_id: shop.id
     });
   } catch (e) {
     fail(res, e.message || '查询失败', 500);
@@ -125,5 +127,62 @@ exports.webhookEleme = async (req, res) => {
   } catch (e) {
     console.error('[delivery/webhook/eleme]', e);
     res.status(500).json({ code: 1, msg: 'fail' });
+  }
+};
+
+// GET /market/merchant/delivery/bindings
+exports.merchantBindings = async (req, res) => {
+  try {
+    if (!req.merchantAuth && !resolveUserIdFromReq(req)) return fail(res, '未登录', 401);
+    const shop = await resolveShopForMerchant(req);
+    if (!shop) return fail(res, '暂无店铺', 404);
+    const bindings = await shopBinding.getBindingsView(shop.id);
+    ok(res, {
+      shop_id: shop.id,
+      shop_name: shop.name || shop.shop_name,
+      bindings,
+      mock_mode: delivery.useMock()
+    });
+  } catch (e) {
+    console.error('[delivery/bindings]', e);
+    fail(res, e.message || '查询失败', 500);
+  }
+};
+
+// POST /market/merchant/delivery/bindings/meituan/register
+exports.merchantBindMeituanRegister = async (req, res) => {
+  try {
+    if (!req.merchantAuth && !resolveUserIdFromReq(req)) return fail(res, '未登录', 401);
+    const shop = await resolveShopForMerchant(req);
+    if (!shop) return fail(res, '暂无店铺', 404);
+    const result = await shopBinding.registerShopOnMeituan(shop);
+    ok(res, {
+      shop_id: shop.id,
+      external_shop_id: result.external_shop_id,
+      meituan_status: result.meituan_status,
+      binding: shopBinding.bindingToView(result.binding)
+    }, '美团门店注册成功');
+  } catch (e) {
+    console.error('[delivery/bindings/meituan/register]', e);
+    fail(res, e.message || '注册失败', 400);
+  }
+};
+
+// POST /market/merchant/delivery/bindings/meituan/test
+exports.merchantBindMeituanTest = async (req, res) => {
+  try {
+    if (!req.merchantAuth && !resolveUserIdFromReq(req)) return fail(res, '未登录', 401);
+    const shop = await resolveShopForMerchant(req);
+    if (!shop) return fail(res, '暂无店铺', 404);
+    const externalShopId = String((req.body || {}).external_shop_id || 'test_0001').trim();
+    const binding = await shopBinding.bindMeituanTestShop(shop, externalShopId);
+    ok(res, {
+      shop_id: shop.id,
+      external_shop_id: externalShopId,
+      binding: shopBinding.bindingToView(binding)
+    }, '美团测试门店绑定成功');
+  } catch (e) {
+    console.error('[delivery/bindings/meituan/test]', e);
+    fail(res, e.message || '绑定失败', 400);
   }
 };

@@ -128,7 +128,7 @@ async function createOrder(ctx) {
     partner_remark: String(ctx.note || '').slice(0, 200),
     order_type: cfg.orderType,
     notify_url: buildNotifyUrl(),
-    chain_store_code: cfg.chainStoreCode || undefined,
+    chain_store_code: ctx.chainStoreCode || cfg.chainStoreCode || undefined,
     transport_info: {
       transport_name: String(ctx.shopName || '门店').slice(0, 64),
       transport_address: String(ctx.shopAddress || '').slice(0, 255),
